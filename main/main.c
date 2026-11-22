@@ -38,6 +38,7 @@ static const TickType_t button_poll_ticks = pdMS_TO_TICKS(10);
 static const TickType_t button_debounce_ticks = pdMS_TO_TICKS(30);
 static const TickType_t startup_screen_ticks = pdMS_TO_TICKS(5000);
 static const TickType_t activity_flash_ticks = pdMS_TO_TICKS(40);
+static const TickType_t display_refresh_ticks = pdMS_TO_TICKS(30);
 
 static const TickType_t battery_poll_ticks = pdMS_TO_TICKS(2000);
 
@@ -157,7 +158,7 @@ static esp_err_t show_status(system_mode_t mode, radio_link_status_t link,
                              bool tx_active, bool rx_active, int battery_cv)
 {
     char rssi[16] = "NA";
-    if (link.connected) {
+    if (link.connected && link.rssi_valid) {
         /* Round the half-dBm reading to a whole dBm for the display. */
         const int dbm = (link.rssi_dbm_x2 - 1) / 2;
         snprintf(rssi, sizeof(rssi), "%d  %d%%", dbm, rssi_percent(link.rssi_dbm_x2));
@@ -230,7 +231,9 @@ void app_main(void)
     bool last_sample = stable_pressed;
     TickType_t last_change = xTaskGetTickCount();
     system_mode_t mode = MODE_MASTER;
-    ESP_ERROR_CHECK_WITHOUT_ABORT(ssd1306_show_centered_text("MASTER", 1));
+    const esp_err_t startup_display = ssd1306_show_centered_text("MASTER", 1);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(startup_display);
+    bool display_ready = startup_display == ESP_OK;
     const TickType_t startup_screen_since = xTaskGetTickCount();
     ESP_ERROR_CHECK_WITHOUT_ABORT(radio_link_start());
 
@@ -253,6 +256,7 @@ void app_main(void)
     bool shown_rx = false;
     TickType_t last_tx = 0;
     TickType_t last_rx = 0;
+    TickType_t last_display_attempt = xTaskGetTickCount() - display_refresh_ticks;
 
     while (true) {
         vTaskDelay(button_poll_ticks);
@@ -292,16 +296,35 @@ void app_main(void)
                 last_battery_sample = now;
             }
             const radio_link_status_t link = radio_link_get_status();
-            if (!showing_status || mode != shown_mode || link.connected != shown_link.connected ||
+            const bool changed = !showing_status || mode != shown_mode ||
+                link.connected != shown_link.connected || link.rssi_valid != shown_link.rssi_valid ||
                 link.rssi_dbm_x2 != shown_link.rssi_dbm_x2 ||
                 link.missed_packets != shown_link.missed_packets ||
                 link.scan_state != shown_link.scan_state ||
                 link.scan_percent != shown_link.scan_percent ||
                 link.scan_seconds_left != shown_link.scan_seconds_left ||
                 tx_active != shown_tx || rx_active != shown_rx ||
-                (!scanning && battery_cv != shown_battery_cv)) {
-                ESP_ERROR_CHECK_WITHOUT_ABORT(scanning ? show_scan(mode, link) :
-                                               show_status(mode, link, tx_active, rx_active, battery_cv));
+                (!scanning && battery_cv != shown_battery_cv);
+            if (changed && now - last_display_attempt >= display_refresh_ticks) {
+                last_display_attempt = now;
+                if (!display_ready) {
+                    ssd1306_deinit();
+                    const esp_err_t init = ssd1306_init();
+                    ESP_ERROR_CHECK_WITHOUT_ABORT(init);
+                    if (init != ESP_OK) {
+                        continue;
+                    }
+                }
+                esp_err_t result = scanning ? show_scan(mode, link) :
+                                   show_status(mode, link, tx_active, rx_active, battery_cv);
+                if (result == ESP_OK && !display_ready) {
+                    result = ssd1306_set_enabled(true);
+                    display_ready = result == ESP_OK;
+                }
+                ESP_ERROR_CHECK_WITHOUT_ABORT(result);
+                if (result != ESP_OK) {
+                    continue;
+                }
                 showing_status = true;
                 shown_mode = mode;
                 shown_link = link;

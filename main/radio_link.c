@@ -16,12 +16,13 @@ enum {
     DATA_LENGTH = 50,
     ALIVE_OFFSET = DATA_LENGTH,
     FRAME_LENGTH = DATA_LENGTH + 1,
-    CYCLE_MS = 100,
+    CYCLE_MS = 20,
     RX_WINDOW_MS = (CYCLE_MS * 110 + 99) / 100,
     LINK_EXPIRY_MS = 3 * CYCLE_MS,
-    RX_SLICE_MS = 10,
-    TX_TIMEOUT_MS = 35,
-    SLAVE_TURNAROUND_MS = 20,
+    RSSI_AVERAGE_MS = 1000,
+    RX_SLICE_MS = 2,
+    TX_TIMEOUT_MS = 12,
+    SLAVE_TURNAROUND_MS = 2,
     SCAN_CHANNELS = 8,
     SCAN_CHANNEL_SECONDS = 6,
     SCAN_TOTAL_SECONDS = SCAN_CHANNELS * SCAN_CHANNEL_SECONDS,
@@ -51,6 +52,9 @@ typedef struct {
     uint32_t last_good_cycle;
     TickType_t slave_window_start;
     uint32_t slave_timed_misses;
+    TickType_t rssi_window_start;
+    int32_t rssi_sum_x2;
+    int32_t rssi_samples;
 } link_state_t;
 
 static const char *const TAG = "radio_link";
@@ -108,11 +112,32 @@ static void publish_status(const mode_request_t *request, const link_state_t *st
     xQueueOverwrite(samples, &sample);
 }
 
+static void publish_rssi_average(const mode_request_t *request, link_state_t *state, TickType_t now)
+{
+    const TickType_t window = pdMS_TO_TICKS(RSSI_AVERAGE_MS);
+    const TickType_t elapsed = now - state->rssi_window_start;
+    if (elapsed < window) {
+        return;
+    }
+    state->rssi_window_start += (elapsed / window) * window;
+    state->status.rssi_valid = state->rssi_samples != 0;
+    if (state->status.rssi_valid) {
+        state->status.rssi_dbm_x2 =
+            (state->rssi_sum_x2 - state->rssi_samples / 2) / state->rssi_samples;
+    }
+    state->rssi_sum_x2 = 0;
+    state->rssi_samples = 0;
+    publish_status(request, state);
+}
+
 static void expire_link(const mode_request_t *request, link_state_t *state)
 {
     if (state->status.connected &&
         xTaskGetTickCount() - state->last_rx >= pdMS_TO_TICKS(LINK_EXPIRY_MS)) {
         state->status.connected = false;
+        state->status.rssi_valid = false;
+        state->rssi_sum_x2 = 0;
+        state->rssi_samples = 0;
         ESP_LOGW(TAG, "%s LINK DOWN: no valid RX for %d ms, missed=%" PRIu32,
                  mode_name(request->mode), LINK_EXPIRY_MS, state->status.missed_packets);
         publish_status(request, state);
@@ -214,7 +239,9 @@ static bool accept_frame(const mode_request_t *request, link_state_t *state,
     state->slave_window_start = state->last_rx;
     state->slave_timed_misses = 0;
     state->status.connected = true;
-    state->status.rssi_dbm_x2 = metrics->rssi_dbm_x2;
+    publish_rssi_average(request, state, state->last_rx);
+    state->rssi_sum_x2 += metrics->rssi_dbm_x2;
+    ++state->rssi_samples;
     record_activity(RADIO_LINK_ACTIVITY_RX);
     publish_status(request, state);
     return true;
@@ -433,7 +460,7 @@ static void radio_task(void *argument)
     config.tx_power_dbm = CONFIG_LINK_TX_POWER_DBM;
     const esp_err_t result = sx1262_init(&config);
     mode_request_t request = {.mode = MODE_MASTER};
-    link_state_t state = {0};
+    link_state_t state = {.rssi_window_start = xTaskGetTickCount()};
     if (result != ESP_OK) {
         ESP_ERROR_CHECK_WITHOUT_ABORT(result);
         state.status.scan_state = SCAN_ERROR;
@@ -448,7 +475,8 @@ static void radio_task(void *argument)
              (unsigned)FRAME_LENGTH, (unsigned)CYCLE_MS);
     for (;;) {
         if (xQueueReceive(requests, &request, 0) == pdPASS) {
-            state = (link_state_t){.slave_window_start = xTaskGetTickCount()};
+            const TickType_t now = xTaskGetTickCount();
+            state = (link_state_t){.slave_window_start = now, .rssi_window_start = now};
             ESP_ERROR_CHECK_WITHOUT_ABORT(sx1262_standby());
             ESP_LOGI(TAG, "%s mode selected", mode_name(request.mode));
             publish_status(&request, &state);
@@ -467,6 +495,7 @@ static void radio_task(void *argument)
             }
         }
         expire_link(&request, &state);
+        publish_rssi_average(&request, &state, xTaskGetTickCount());
         if (request.mode == MODE_MASTER) {
             const TickType_t started = xTaskGetTickCount();
             mode_request_t pending;

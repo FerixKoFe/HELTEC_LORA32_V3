@@ -17,19 +17,21 @@ uses whitening seed `0x1FF`. The MASTER/SLAVE application sends and expects
 51 bytes: 50 data bytes and one Alive CNT byte.
 
 MASTER sends a fresh random payload with an even counter on a nominal
-100 ms cycle. Both roles allow 110% of the cycle (110 ms) for a valid
-receive. If MASTER is still waiting at 100 ms, it starts the next cycle
+20 ms cycle. Both roles allow 110% of the cycle (22 ms) for a valid
+receive. If MASTER is still waiting at 20 ms, it starts the next cycle
 after the receive window closes.
 SLAVE replies with the bitwise inverse and the matching odd counter.
 Counters wrap at 256. MASTER validates the CRC, counter, and inverted
 payload. SLAVE validates the CRC, parity, and sequence. A valid receive
-sets LINK UP. After 300 ms without a valid receive the link drops.
+sets LINK UP. After 60 ms without a valid receive the link drops.
 The first valid exchange in each mode clears MISS. SLAVE shows a provisional
-miss per 110 ms without a valid MASTER frame. A later in-sequence counter
+miss per 22 ms without a valid MASTER frame. A later in-sequence counter
 clears the provisional miss, while a counter gap records the confirmed loss.
 SLAVE LINK reports valid requests; MASTER LINK reports validated replies.
 UART0 at 115200 baud logs counters, gaps, errors, RSSI, MASTER RX readiness and
-round-trip time, and SLAVE reply completion. Enable `LINK_LOG_PAYLOAD` for
+round-trip time, and SLAVE reply completion. Each valid receive produces
+a UART line with the packet's RSSI. The OLED shows a one-second RSSI average.
+Enable `LINK_LOG_PAYLOAD` for
 full payload hex dumps.
 
 ## Channel scans

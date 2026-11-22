@@ -26,6 +26,8 @@ static const char *const TAG = "ssd1306";
 static i2c_master_bus_handle_t bus;
 static i2c_master_dev_handle_t display;
 static uint8_t frame[1 + OLED_WIDTH * OLED_HEIGHT / 8] = {0x40};
+static uint8_t sent_pixels[sizeof(frame) - 1];
+static bool sent_pixels_valid;
 
 /* Each byte is a column, with the least significant bit at the top. */
 static const uint8_t font['m' - ' ' + 1][GLYPH_WIDTH] = {
@@ -178,13 +180,56 @@ esp_err_t ssd1306_set_pixel(int x, int y, bool on)
     return ESP_OK;
 }
 
+static esp_err_t send_window(uint8_t first_column, uint8_t last_column,
+                             uint8_t first_page, uint8_t last_page,
+                             const uint8_t *data, size_t size)
+{
+    const uint8_t address[] = {
+        0x00, 0x21, first_column, last_column, 0x22, first_page, last_page,
+    };
+    esp_err_t result = send_bytes(address, sizeof(address));
+    if (result == ESP_OK) {
+        result = send_bytes(data, size);
+    }
+    if (result != ESP_OK) {
+        sent_pixels_valid = false;
+    }
+    return result;
+}
+
 esp_err_t ssd1306_refresh(void)
 {
-    static const uint8_t address[] = {
-        0x00, 0x21, 0x00, OLED_WIDTH - 1, 0x22, 0x00, OLED_HEIGHT / 8 - 1,
-    };
-    ESP_RETURN_ON_ERROR(send_bytes(address, sizeof(address)), TAG, "Address setup failed");
-    return send_bytes(frame, sizeof(frame));
+    if (!sent_pixels_valid) {
+        ESP_RETURN_ON_ERROR(send_window(0, OLED_WIDTH - 1, 0, OLED_HEIGHT / 8 - 1,
+                                        frame, sizeof(frame)), TAG, "Full frame transfer failed");
+        memcpy(sent_pixels, frame + 1, sizeof(sent_pixels));
+        sent_pixels_valid = true;
+        return ESP_OK;
+    }
+
+    uint8_t data[1 + OLED_WIDTH] = {0x40};
+    for (int page = 0; page < OLED_HEIGHT / 8; ++page) {
+        const size_t offset = page * OLED_WIDTH;
+        const uint8_t *pixels = frame + 1 + offset;
+        uint8_t *previous = sent_pixels + offset;
+        int first = 0;
+        while (first < OLED_WIDTH && pixels[first] == previous[first]) {
+            ++first;
+        }
+        if (first == OLED_WIDTH) {
+            continue;
+        }
+        int last = OLED_WIDTH - 1;
+        while (pixels[last] == previous[last]) {
+            --last;
+        }
+        const size_t count = last - first + 1;
+        memcpy(data + 1, pixels + first, count);
+        ESP_RETURN_ON_ERROR(send_window(first, last, page, page, data, count + 1),
+                            TAG, "Partial frame transfer failed");
+        memcpy(previous + first, pixels + first, count);
+    }
+    return ESP_OK;
 }
 
 esp_err_t ssd1306_set_frame(const uint8_t *pixels, size_t size)
@@ -225,6 +270,7 @@ esp_err_t ssd1306_init(void)
     if (bus) {
         return ESP_ERR_INVALID_STATE;
     }
+    sent_pixels_valid = false;
     const gpio_config_t outputs = {
         .pin_bit_mask = (1ULL << OLED_RESET) | (1ULL << OLED_VEXT),
         .mode = GPIO_MODE_OUTPUT,
@@ -274,6 +320,7 @@ esp_err_t ssd1306_deinit(void)
     }
     ESP_RETURN_ON_ERROR(i2c_del_master_bus(bus), TAG, "Could not release I2C bus");
     bus = NULL;
+    sent_pixels_valid = false;
     return result;
 }
 

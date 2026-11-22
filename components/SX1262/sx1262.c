@@ -158,7 +158,7 @@ sx1262_config_t sx1262_default_config(uint32_t frequency_hz)
     };
 }
 
-esp_err_t sx1262_standby(void)
+static esp_err_t set_standby(uint8_t clock)
 {
     if (!radio) {
         return ESP_ERR_INVALID_STATE;
@@ -170,11 +170,16 @@ esp_err_t sx1262_standby(void)
         CHECK(wait_busy());
         sleeping = false;
     }
-    const esp_err_t result = WRITE(SET_STANDBY, 0);
+    const esp_err_t result = WRITE(SET_STANDBY, clock);
     if (result == ESP_OK) {
         continuous_rx = false;
     }
     return result;
+}
+
+esp_err_t sx1262_standby(void)
+{
+    return set_standby(0);
 }
 
 esp_err_t sx1262_sleep(void)
@@ -379,7 +384,7 @@ static esp_err_t start_radio(const sx1262_config_t *config)
     CHECK(WRITE(CALIBRATE, 0x3F));
     CHECK(WRITE(SET_RF_SWITCH, 1)); /* DIO2 controls the antenna switch. */
     CHECK(WRITE(SET_REGULATOR, 1)); /* DC-DC */
-    CHECK(WRITE(SET_FALLBACK, 0x20)); /* STDBY_RC after TX/RX */
+    CHECK(WRITE(SET_FALLBACK, 0x30)); /* Keep the oscillator on after TX/RX. */
     CHECK(WRITE(SET_PA, 0x04, 0x07, 0x00, 0x01));
     CHECK(WRITE(WRITE_REGISTER, 0x08, 0xE7, 0x38)); /* 160 mA OCP */
     CHECK(update_register(0x08D8, 0x1E, 0x1E)); /* TX clamp workaround */
@@ -441,7 +446,7 @@ esp_err_t sx1262_deinit(void)
 
 static esp_err_t prepare_packet(uint8_t length)
 {
-    CHECK(sx1262_standby());
+    CHECK(set_standby(1)); /* STDBY_XOSC for fast TX/RX turnaround. */
     CHECK(WRITE(CLEAR_IRQ, 0x03, 0xFF));
     return packet_params(&current, length);
 }
@@ -484,8 +489,11 @@ static esp_err_t run_packet(uint8_t opcode, uint32_t timeout_ms, uint16_t done)
     if (result == ESP_OK) {
         result = wait_packet_irq(deadline, done, &observed);
     }
-    const esp_err_t standby_result = sx1262_standby();
-    return result == ESP_OK ? standby_result : result;
+    if (result != ESP_OK) {
+        /* Explicitly stop on timeout or error. Success already falls back to XOSC. */
+        ESP_ERROR_CHECK_WITHOUT_ABORT(set_standby(1));
+    }
+    return result;
 }
 
 esp_err_t sx1262_send(const void *payload, size_t length, uint32_t timeout_ms)

@@ -21,6 +21,7 @@ typedef enum {
 
 typedef struct {
     bool connected;
+    bool rssi_valid;
     int16_t rssi_dbm_x2;
     uint32_t missed_packets;
     scan_state_t scan_state;
