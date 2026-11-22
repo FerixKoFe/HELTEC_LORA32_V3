@@ -9,7 +9,7 @@
 #define SX1262_MAX_PAYLOAD 255
 #define SX1262_SYNC_PRIVATE 0x1424
 #define SX1262_SYNC_PUBLIC 0x3444
-#define SX1262_GFSK_DEFAULT_PAYLOAD_LENGTH 54
+#define SX1262_GFSK_DEFAULT_MAX_PAYLOAD_LENGTH 64
 
 /* Values match the SX1262 LoRa bandwidth field. */
 typedef enum {
@@ -28,7 +28,8 @@ typedef struct {
     uint32_t deviation_hz;
     uint16_t preamble_bits;
     uint8_t sync_word[4];
-    uint8_t fixed_payload_length;
+    uint8_t fixed_payload_length; /* Zero selects variable length. */
+    uint8_t max_payload_length;   /* Used in variable-length mode. */
     uint16_t whitening_seed;
 } sx1262_gfsk_config_t;
 
@@ -58,7 +59,7 @@ typedef struct {
  * Send/receive are synchronous, with a timeout of 1..262143 ms.
  */
 sx1262_config_t sx1262_default_config(uint32_t frequency_hz);
-/* BT 0.5, 117.3 kHz RX BW, 32-bit preamble detector, CRC-16, whitening, boosted RX. */
+/* BT 0.5, 187.2 kHz RX BW, 16-bit preamble detector, CRC-16, whitening, boosted RX. */
 sx1262_config_t sx1262_default_gfsk_config(uint32_t frequency_hz);
 esp_err_t sx1262_init(const sx1262_config_t *config);
 esp_err_t sx1262_deinit(void);

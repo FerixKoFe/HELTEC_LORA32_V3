@@ -10,13 +10,27 @@ config LINK_FREQUENCY_HZ
 config LINK_TX_POWER_DBM
     int "Link transmit power (dBm)"
     range -9 22
-    default 22
+    default 14
+
+config LINK_LOG_PAYLOAD
+    bool "Log complete radio payloads on UART"
+    default n
+    help
+        Enable hex dumps for each transmitted and received payload.
 
 endmenu
 
 menu "Heltec battery measurement"
 
+config HELTEC_USB_ONLY
+    bool "USB-only operation (no battery connected)"
+    default n
+    help
+        Disable battery measurement for boards used without a battery.
+        The USB-powered charger can drive VBAT even with no cell connected.
+
 config HELTEC_BATTERY_ADC_ACTIVE_HIGH
+    depends on !HELTEC_USB_ONLY
     bool "Active-high ADC_Ctrl (Heltec WiFi LoRa 32 V3.2)"
     default n
     help

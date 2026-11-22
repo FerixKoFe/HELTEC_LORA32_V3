@@ -5,8 +5,10 @@
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_check.h"
+#include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 /* Heltec WiFi LoRa 32 V3.1 board connections. Command framing and board
@@ -37,15 +39,22 @@ static sx1262_config_t current;
 static bool configured;
 static bool sleeping;
 static bool continuous_rx;
+static SemaphoreHandle_t dio1_event;
 
 static esp_err_t wait_busy(void)
 {
-    const int64_t deadline = esp_timer_get_time() + 150000;
+    const int64_t started = esp_timer_get_time();
     while (gpio_get_level(PIN_BUSY)) {
-        if (esp_timer_get_time() >= deadline) {
+        const int64_t elapsed = esp_timer_get_time() - started;
+        if (elapsed >= 150000) {
             return ESP_ERR_TIMEOUT;
         }
-        vTaskDelay(1);
+        /* Ordinary SPI commands clear BUSY well before a FreeRTOS tick. */
+        if (elapsed < 1000) {
+            esp_rom_delay_us(5);
+        } else {
+            vTaskDelay(1);
+        }
     }
     return ESP_OK;
 }
@@ -113,7 +122,8 @@ static bool valid_config(const sx1262_config_t *config)
         const sx1262_gfsk_config_t *gfsk = &config->gfsk;
         return gfsk->bitrate_bps >= 600 && gfsk->bitrate_bps <= 300000 &&
                gfsk->deviation_hz >= 600 && gfsk->deviation_hz <= 200000 &&
-               gfsk->preamble_bits >= 32 && gfsk->fixed_payload_length &&
+               gfsk->preamble_bits >= 16 &&
+               (gfsk->fixed_payload_length || gfsk->max_payload_length) &&
                gfsk->whitening_seed <= 0x1FF;
     }
     return config->modulation == SX1262_MOD_LORA &&
@@ -127,12 +137,13 @@ sx1262_config_t sx1262_default_gfsk_config(uint32_t frequency_hz)
 {
     return (sx1262_config_t){
         .frequency_hz = frequency_hz,
+        .tx_power_dbm = 14,
         .modulation = SX1262_MOD_GFSK,
         .crc_enabled = true,
         .gfsk = {
-            .bitrate_bps = 50000, .deviation_hz = 25000, .preamble_bits = 64,
+            .bitrate_bps = 100000, .deviation_hz = 25000, .preamble_bits = 32,
             .sync_word = {0x2D, 0xD4, 0xB7, 0xE1},
-            .fixed_payload_length = SX1262_GFSK_DEFAULT_PAYLOAD_LENGTH,
+            .max_payload_length = SX1262_GFSK_DEFAULT_MAX_PAYLOAD_LENGTH,
             .whitening_seed = 0x1FF,
         },
     };
@@ -188,8 +199,9 @@ static esp_err_t packet_params(const sx1262_config_t *config, uint8_t length)
 {
     if (config->modulation == SX1262_MOD_GFSK) {
         const uint16_t preamble = config->gfsk.preamble_bits;
-        /* Detector: 32 bits; sync: 32 bits; no address filter; fixed length. */
-        return WRITE(SET_PACKET, preamble >> 8, preamble, 0x07, 32, 0, 0,
+        /* Detector: 16 bits; sync: 32 bits; no address filter. */
+        return WRITE(SET_PACKET, preamble >> 8, preamble, 0x05, 32, 0,
+                     config->gfsk.fixed_payload_length == 0,
                      length, config->crc_enabled ? 0x02 : 0x01, 1);
     }
     CHECK(WRITE(SET_PACKET, config->preamble_symbols >> 8, config->preamble_symbols,
@@ -204,7 +216,7 @@ static esp_err_t configure_gfsk(const sx1262_gfsk_config_t *config)
     const uint32_t bitrate = 1024000000U / config->bitrate_bps;
     const uint32_t deviation = (((uint64_t)config->deviation_hz << 25) + 16000000) / 32000000;
     CHECK(WRITE(SET_MODULATION, bitrate >> 16, bitrate >> 8, bitrate,
-                0x09, 0x0B, deviation >> 16, deviation >> 8, deviation)); /* BT 0.5, 117.3 kHz */
+                0x09, 0x12, deviation >> 16, deviation >> 8, deviation)); /* BT 0.5, 187.2 kHz */
     CHECK(update_register(0x0889, 0x04, 0x04));
     CHECK(WRITE(WRITE_REGISTER, 0x06, 0xC0, config->sync_word[0], config->sync_word[1],
                 config->sync_word[2], config->sync_word[3]));
@@ -219,6 +231,16 @@ static uint8_t fixed_payload_length(const sx1262_config_t *config)
 {
     return config->modulation == SX1262_MOD_GFSK ?
            config->gfsk.fixed_payload_length : config->implicit_payload_length;
+}
+
+static uint8_t receive_payload_limit(const sx1262_config_t *config)
+{
+    const uint8_t fixed_length = fixed_payload_length(config);
+    if (fixed_length) {
+        return fixed_length;
+    }
+    return config->modulation == SX1262_MOD_GFSK ?
+           config->gfsk.max_payload_length : SX1262_MAX_PAYLOAD;
 }
 
 static esp_err_t configure_lora(const sx1262_config_t *config)
@@ -247,8 +269,7 @@ esp_err_t sx1262_set_config(const sx1262_config_t *config)
     CHECK(WRITE(SET_PACKET_TYPE, gfsk ? 0 : 1));
     CHECK(gfsk ? configure_gfsk(&config->gfsk) : configure_lora(config));
     CHECK(WRITE(SET_TX_PARAMS, config->tx_power_dbm, 0x04)); /* 200 us ramp */
-    const uint8_t fixed_length = fixed_payload_length(config);
-    CHECK(packet_params(config, fixed_length ? fixed_length : SX1262_MAX_PAYLOAD));
+    CHECK(packet_params(config, receive_payload_limit(config)));
     current = *config;
     configured = true;
     return ESP_OK;
@@ -304,6 +325,35 @@ esp_err_t sx1262_get_tx_power(int8_t *dbm)
     return ESP_OK;
 }
 
+static void dio1_isr(void *argument)
+{
+    BaseType_t higher_priority_task_woken = pdFALSE;
+    xSemaphoreGiveFromISR((SemaphoreHandle_t)argument, &higher_priority_task_woken);
+    if (higher_priority_task_woken) {
+        portYIELD_FROM_ISR();
+    }
+}
+
+static esp_err_t start_dio1_interrupt(void)
+{
+    const esp_err_t service = gpio_install_isr_service(0);
+    if (service != ESP_OK && service != ESP_ERR_INVALID_STATE) {
+        return service;
+    }
+    CHECK(gpio_set_intr_type(PIN_DIO1, GPIO_INTR_POSEDGE));
+    SemaphoreHandle_t event = xSemaphoreCreateBinary();
+    if (!event) {
+        return ESP_ERR_NO_MEM;
+    }
+    const esp_err_t result = gpio_isr_handler_add(PIN_DIO1, dio1_isr, event);
+    if (result != ESP_OK) {
+        vSemaphoreDelete(event);
+        return result;
+    }
+    dio1_event = event;
+    return ESP_OK;
+}
+
 static esp_err_t start_radio(const sx1262_config_t *config)
 {
     const gpio_config_t inputs = {
@@ -336,7 +386,8 @@ static esp_err_t start_radio(const sx1262_config_t *config)
     CHECK(WRITE(SET_FIFO_BASE, 0, 0));
     CHECK(WRITE(SET_IRQ, PACKET_IRQS >> 8, PACKET_IRQS & 0xFF,
                 PACKET_IRQS >> 8, PACKET_IRQS & 0xFF, 0, 0, 0, 0));
-    return sx1262_set_config(config);
+    CHECK(sx1262_set_config(config));
+    return start_dio1_interrupt();
 }
 
 esp_err_t sx1262_init(const sx1262_config_t *config)
@@ -376,6 +427,11 @@ esp_err_t sx1262_deinit(void)
     const esp_err_t sleep_result = sx1262_sleep();
     CHECK(spi_bus_remove_device(radio));
     radio = NULL;
+    if (dio1_event) {
+        gpio_isr_handler_remove(PIN_DIO1);
+        vSemaphoreDelete(dio1_event);
+        dio1_event = NULL;
+    }
     configured = false;
     sleeping = false;
     continuous_rx = false;
@@ -387,7 +443,7 @@ static esp_err_t prepare_packet(uint8_t length)
 {
     CHECK(sx1262_standby());
     CHECK(WRITE(CLEAR_IRQ, 0x03, 0xFF));
-    return current.modulation == SX1262_MOD_GFSK ? ESP_OK : packet_params(&current, length);
+    return packet_params(&current, length);
 }
 
 static esp_err_t wait_packet_irq(int64_t deadline, uint16_t done, uint16_t *observed)
@@ -410,10 +466,12 @@ static esp_err_t wait_packet_irq(int64_t deadline, uint16_t done, uint16_t *obse
                 return ESP_ERR_TIMEOUT;
             }
         }
-        if (esp_timer_get_time() >= deadline) {
+        const int64_t remaining_us = deadline - esp_timer_get_time();
+        if (remaining_us <= 0) {
             return ESP_ERR_TIMEOUT;
         }
-        vTaskDelay(1);
+        const TickType_t wait_ticks = (remaining_us * configTICK_RATE_HZ + 999999) / 1000000;
+        xSemaphoreTake(dio1_event, wait_ticks);
     }
 }
 
@@ -436,7 +494,7 @@ esp_err_t sx1262_send(const void *payload, size_t length, uint32_t timeout_ms)
         return ESP_ERR_INVALID_STATE;
     }
     const uint8_t fixed_length = fixed_payload_length(&current);
-    if (!payload || !length || length > SX1262_MAX_PAYLOAD ||
+    if (!payload || !length || length > receive_payload_limit(&current) ||
         !timeout_ms || timeout_ms > MAX_TIMEOUT_MS ||
         (fixed_length && length != fixed_length)) {
         return ESP_ERR_INVALID_ARG;
@@ -456,6 +514,9 @@ static esp_err_t read_packet(void *payload, size_t capacity, size_t *length,
     CHECK(read_response(buffer_status, sizeof(buffer_status), buffer, sizeof(buffer)));
     const uint8_t fixed_length = fixed_payload_length(&current);
     const size_t received = fixed_length ? fixed_length : buffer[0];
+    if (received > receive_payload_limit(&current)) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
     if (capacity < received) {
         *length = received;
         return ESP_ERR_INVALID_SIZE;
@@ -488,8 +549,7 @@ esp_err_t sx1262_receive(void *payload, size_t capacity, size_t *length,
     if (!configured) {
         return ESP_ERR_INVALID_STATE;
     }
-    const uint8_t fixed_length = fixed_payload_length(&current);
-    CHECK(prepare_packet(fixed_length ? fixed_length : SX1262_MAX_PAYLOAD));
+    CHECK(prepare_packet(receive_payload_limit(&current)));
     const esp_err_t result = run_packet(SET_RX, timeout_ms, IRQ_RX_DONE);
     if (result != ESP_OK) {
         return result;
@@ -508,8 +568,7 @@ esp_err_t sx1262_start_continuous_rx(void)
         return ESP_ERR_INVALID_STATE;
     }
     if (!continuous_rx) {
-        const uint8_t length = fixed_payload_length(&current);
-        CHECK(prepare_packet(length ? length : SX1262_MAX_PAYLOAD));
+        CHECK(prepare_packet(receive_payload_limit(&current)));
         CHECK(WRITE(SET_RX, 0xFF, 0xFF, 0xFF));
         continuous_rx = true;
     }
@@ -545,11 +604,11 @@ esp_err_t sx1262_receive_continuous(void *payload, size_t capacity, size_t *leng
     uint16_t observed;
     const int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
     esp_err_t result = wait_packet_irq(deadline, IRQ_RX_DONE, &observed);
-    if (observed) {
-        CHECK(WRITE(CLEAR_IRQ, observed >> 8, observed));
-    }
     if (result == ESP_OK) {
         result = read_packet(payload, capacity, length, metrics);
+    }
+    if (observed) {
+        CHECK(WRITE(CLEAR_IRQ, observed >> 8, observed));
     }
     return result;
 }

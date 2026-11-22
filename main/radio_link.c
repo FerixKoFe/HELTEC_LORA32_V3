@@ -15,15 +15,13 @@
 enum {
     DATA_LENGTH = 50,
     ALIVE_OFFSET = DATA_LENGTH,
-    CRC_OFFSET = ALIVE_OFFSET + 1,
-    FRAME_LENGTH = CRC_OFFSET + 2,
+    FRAME_LENGTH = DATA_LENGTH + 1,
     CYCLE_MS = 100,
-    SLAVE_RX_TIMEOUT_MS = CYCLE_MS + 50,
+    RX_WINDOW_MS = (CYCLE_MS * 110 + 99) / 100,
     LINK_EXPIRY_MS = 3 * CYCLE_MS,
     RX_SLICE_MS = 10,
     TX_TIMEOUT_MS = 35,
-    MASTER_RX_LIMIT_MS = CYCLE_MS - 20,
-    SLAVE_TURNAROUND_MS = 10,
+    SLAVE_TURNAROUND_MS = 20,
     SCAN_CHANNELS = 8,
     SCAN_CHANNEL_SECONDS = 6,
     SCAN_TOTAL_SECONDS = SCAN_CHANNELS * SCAN_CHANNEL_SECONDS,
@@ -86,32 +84,7 @@ static const char *mode_name(system_mode_t mode)
     return "UNKNOWN";
 }
 
-/* CRC-16/CCITT-FALSE over the 50 data bytes followed by Alive CNT. */
-static uint16_t frame_crc(const uint8_t *data)
-{
-    uint16_t crc = 0xFFFF;
-    for (size_t index = 0; index < CRC_OFFSET; ++index) {
-        crc ^= (uint16_t)data[index] << 8;
-        for (unsigned bit = 0; bit < 8; ++bit) {
-            crc = (crc << 1) ^ ((crc & 0x8000) ? 0x1021 : 0);
-        }
-    }
-    return crc;
-}
-
-static void finish_frame(uint8_t frame[FRAME_LENGTH], uint8_t counter)
-{
-    frame[ALIVE_OFFSET] = counter;
-    const uint16_t crc = frame_crc(frame);
-    frame[CRC_OFFSET] = crc >> 8;
-    frame[CRC_OFFSET + 1] = crc;
-}
-
-static uint16_t received_crc(const uint8_t frame[FRAME_LENGTH])
-{
-    return ((uint16_t)frame[CRC_OFFSET] << 8) | frame[CRC_OFFSET + 1];
-}
-
+#ifdef CONFIG_LINK_LOG_PAYLOAD
 static void log_frame(system_mode_t mode, const char *direction,
                       const uint8_t frame[FRAME_LENGTH])
 {
@@ -122,9 +95,12 @@ static void log_frame(system_mode_t mode, const char *direction,
         data[2 * i + 1] = hex[frame[i] & 0x0F];
     }
     data[sizeof(data) - 1] = '\0';
-    ESP_LOGI(TAG, "%s %s alive=%u crc=%04X data=%s", mode_name(mode), direction,
-             (unsigned)frame[ALIVE_OFFSET], (unsigned)received_crc(frame), data);
+    ESP_LOGI(TAG, "%s %s alive=%u data=%s", mode_name(mode), direction,
+             (unsigned)frame[ALIVE_OFFSET], data);
 }
+#else
+#define log_frame(mode, direction, frame) ((void)0)
+#endif
 
 static void publish_status(const mode_request_t *request, const link_state_t *state)
 {
@@ -145,7 +121,7 @@ static void expire_link(const mode_request_t *request, link_state_t *state)
 
 static void check_slave_rx_timeout(const mode_request_t *request, link_state_t *state)
 {
-    const TickType_t window = pdMS_TO_TICKS(SLAVE_RX_TIMEOUT_MS);
+    const TickType_t window = pdMS_TO_TICKS(RX_WINDOW_MS);
     const TickType_t elapsed = xTaskGetTickCount() - state->slave_window_start;
     const uint32_t expired_windows = elapsed / window;
     if (!expired_windows) {
@@ -154,9 +130,9 @@ static void check_slave_rx_timeout(const mode_request_t *request, link_state_t *
     state->slave_window_start += expired_windows * window;
     state->slave_timed_misses += expired_windows;
     state->status.missed_packets += expired_windows;
-    ESP_LOGW(TAG, "SLAVE no valid MASTER frame: %d ms window, missed=%" PRIu32
+    ESP_LOGW(TAG, "SLAVE RX timeout: %d ms, provisional=%" PRIu32
                   " total=%" PRIu32,
-             SLAVE_RX_TIMEOUT_MS, expired_windows, state->status.missed_packets);
+             RX_WINDOW_MS, expired_windows, state->status.missed_packets);
     publish_status(request, state);
 }
 
@@ -183,12 +159,6 @@ static bool receive_frame(system_mode_t mode, uint8_t frame[FRAME_LENGTH],
     }
     if (length != FRAME_LENGTH) {
         ESP_LOGW(TAG, "%s RX invalid length=%u", mode_name(mode), (unsigned)length);
-        return false;
-    }
-    const uint16_t crc = frame_crc(frame);
-    if (crc != received_crc(frame)) {
-        ESP_LOGW(TAG, "%s RX CRC mismatch alive=%u got=%04X expected=%04X", mode_name(mode),
-                 (unsigned)frame[ALIVE_OFFSET], (unsigned)received_crc(frame), (unsigned)crc);
         return false;
     }
     const unsigned expected_parity = mode == MODE_MASTER ? 1 : 0;
@@ -220,12 +190,16 @@ static bool accept_frame(const mode_request_t *request, link_state_t *state,
                      (unsigned)counter, (unsigned)state->last_counter);
         } else {
             missed = delta / 2 - 1;
+            /* A late consecutive packet supersedes a provisional timeout. */
+            state->status.missed_packets -= state->slave_timed_misses;
+            state->status.missed_packets += missed;
+            if (state->slave_timed_misses > missed) {
+                ESP_LOGI(TAG, "SLAVE late RX alive=%u, cancelled %" PRIu32 " provisional miss(es)",
+                         (unsigned)counter, state->slave_timed_misses - missed);
+            }
         }
     }
     if (missed) {
-        if (request->mode == MODE_SLAVE && missed > state->slave_timed_misses) {
-            state->status.missed_packets += missed - state->slave_timed_misses;
-        }
         ESP_LOGW(TAG, "%s counter gap prev=%u rx=%u missed=%" PRIu32 " total=%" PRIu32,
                  mode_name(request->mode), (unsigned)state->last_counter,
                  (unsigned)counter, missed, state->status.missed_packets);
@@ -248,23 +222,30 @@ static bool accept_frame(const mode_request_t *request, link_state_t *state,
 
 static bool master_cycle(const mode_request_t *request, link_state_t *state, TickType_t started)
 {
+    const int64_t started_us = esp_timer_get_time();
     uint8_t tx[FRAME_LENGTH];
     const uint8_t counter = (uint8_t)(2U * state->cycle++);
     esp_fill_random(tx, DATA_LENGTH);
-    finish_frame(tx, counter);
+    tx[ALIVE_OFFSET] = counter;
     const esp_err_t result = send_frame(tx);
     if (result != ESP_OK) {
         ESP_LOGW(TAG, "MASTER TX failed alive=%u: %s", (unsigned)counter, esp_err_to_name(result));
         return false;
     }
-    ESP_ERROR_CHECK_WITHOUT_ABORT(sx1262_start_continuous_rx());
-    log_frame(MODE_MASTER, "TX", tx);
+    const esp_err_t rx_result = sx1262_start_continuous_rx();
+    if (rx_result != ESP_OK) {
+        ESP_LOGW(TAG, "MASTER TX done alive=%u, RX start failed: %s",
+                 (unsigned)counter, esp_err_to_name(rx_result));
+        return false;
+    }
+    const int64_t rx_ready_us = esp_timer_get_time() - started_us;
+    const int64_t deadline_us = started_us + RX_WINDOW_MS * 1000LL;
 
     const uint8_t expected = (uint8_t)(counter + 1);
     uint8_t rx[FRAME_LENGTH];
     sx1262_packet_metrics_t metrics;
     mode_request_t pending;
-    while (xTaskGetTickCount() - started < pdMS_TO_TICKS(MASTER_RX_LIMIT_MS) &&
+    while (esp_timer_get_time() < deadline_us &&
            xQueuePeek(requests, &pending, 0) != pdPASS) {
         if (!receive_frame(MODE_MASTER, rx, &metrics)) {
             continue;
@@ -285,12 +266,16 @@ static bool master_cycle(const mode_request_t *request, link_state_t *state, Tic
         }
         const TickType_t elapsed = xTaskGetTickCount() - started;
         accept_frame(request, state, expected, &metrics);
-        log_frame(MODE_MASTER, "RX OK", rx);
-        ESP_LOGI(TAG, "MASTER RSSI_x2=%d RTT_ms=%lu", (int)metrics.rssi_dbm_x2,
+        ESP_LOGI(TAG, "MASTER TX=%u RX=%u RSSI_x2=%d RX_ready_us=%" PRId64 " RTT_ms=%lu",
+                 (unsigned)counter, (unsigned)expected, (int)metrics.rssi_dbm_x2, rx_ready_us,
                  (unsigned long)pdTICKS_TO_MS(elapsed));
+        log_frame(MODE_MASTER, "TX", tx);
+        log_frame(MODE_MASTER, "RX OK", rx);
         return true;
     }
-    ESP_LOGW(TAG, "MASTER no valid response alive=%u", (unsigned)expected);
+    ESP_LOGW(TAG, "MASTER TX done alive=%u, no valid response alive=%u RX_ready_us=%" PRId64,
+             (unsigned)counter, (unsigned)expected, rx_ready_us);
+    log_frame(MODE_MASTER, "TX", tx);
     return false;
 }
 
@@ -298,28 +283,32 @@ static void slave_receive(const mode_request_t *request, link_state_t *state)
 {
     uint8_t rx[FRAME_LENGTH];
     sx1262_packet_metrics_t metrics;
-    const bool received = receive_frame(MODE_SLAVE, rx, &metrics);
-    check_slave_rx_timeout(request, state);
-    if (!received ||
+    if (!receive_frame(MODE_SLAVE, rx, &metrics) ||
         !accept_frame(request, state, rx[ALIVE_OFFSET], &metrics)) {
+        check_slave_rx_timeout(request, state);
         return;
     }
+    const int64_t received_us = esp_timer_get_time();
     uint8_t tx[FRAME_LENGTH];
     for (size_t i = 0; i < DATA_LENGTH; ++i) {
         tx[i] = (uint8_t)~rx[i];
     }
-    finish_frame(tx, (uint8_t)(rx[ALIVE_OFFSET] + 1));
+    tx[ALIVE_OFFSET] = (uint8_t)(rx[ALIVE_OFFSET] + 1);
     /* Leave time for the MASTER to switch from TX to continuous RX. */
     vTaskDelay(pdMS_TO_TICKS(SLAVE_TURNAROUND_MS) + 1);
     const esp_err_t result = send_frame(tx);
+    const int64_t reply_us = esp_timer_get_time() - received_us;
     ESP_ERROR_CHECK_WITHOUT_ABORT(sx1262_start_continuous_rx());
     log_frame(MODE_SLAVE, "RX OK", rx);
-    ESP_LOGI(TAG, "SLAVE RSSI_x2=%d", (int)metrics.rssi_dbm_x2);
     if (result == ESP_OK) {
+        ESP_LOGI(TAG, "SLAVE RX=%u TX_done=%u RSSI_x2=%d reply_us=%" PRId64,
+                 (unsigned)rx[ALIVE_OFFSET], (unsigned)tx[ALIVE_OFFSET],
+                 (int)metrics.rssi_dbm_x2, reply_us);
         log_frame(MODE_SLAVE, "TX", tx);
     } else {
-        ESP_LOGW(TAG, "SLAVE TX failed alive=%u: %s", (unsigned)tx[ALIVE_OFFSET],
-                 esp_err_to_name(result));
+        ESP_LOGW(TAG, "SLAVE RX=%u RSSI_x2=%d TX failed alive=%u: %s",
+                 (unsigned)rx[ALIVE_OFFSET], (int)metrics.rssi_dbm_x2,
+                 (unsigned)tx[ALIVE_OFFSET], esp_err_to_name(result));
     }
 }
 
@@ -378,7 +367,7 @@ static void scan_channels(const mode_request_t *request, link_state_t *state)
     state->status.scan_seconds_left = SCAN_TOTAL_SECONDS;
     publish_status(request, state);
     ESP_LOGI(TAG, "%s scan started: %d channels, %d s, RX BW %s kHz, passive RSSI",
-             label, SCAN_CHANNELS, SCAN_TOTAL_SECONDS, lora ? "125" : "117.3");
+             label, SCAN_CHANNELS, SCAN_TOTAL_SECONDS, lora ? "125" : "187.2");
 
     bool complete = true;
     mode_request_t pending;
@@ -441,7 +430,6 @@ static void radio_task(void *argument)
 {
     (void)argument;
     sx1262_config_t config = sx1262_default_gfsk_config(CONFIG_LINK_FREQUENCY_HZ);
-    config.gfsk.fixed_payload_length = FRAME_LENGTH;
     config.tx_power_dbm = CONFIG_LINK_TX_POWER_DBM;
     const esp_err_t result = sx1262_init(&config);
     mode_request_t request = {.mode = MODE_MASTER};

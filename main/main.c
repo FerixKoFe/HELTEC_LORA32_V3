@@ -27,6 +27,12 @@
 #define BATTERY_CTRL_ON 0
 #endif
 
+#ifdef CONFIG_HELTEC_USB_ONLY
+static const bool usb_only = true;
+#else
+static const bool usb_only = false;
+#endif
+
 static const char *const TAG = "main";
 static const TickType_t button_poll_ticks = pdMS_TO_TICKS(10);
 static const TickType_t button_debounce_ticks = pdMS_TO_TICKS(30);
@@ -165,8 +171,10 @@ static esp_err_t show_status(system_mode_t mode, radio_link_status_t link,
     char missed[24];
     snprintf(missed, sizeof(missed), "MISS: %" PRIu32, link.missed_packets);
     ESP_RETURN_ON_ERROR(ssd1306_draw_text(2, 30, missed, 1), TAG, "Missing packet label failed");
-    char battery[24] = "BAT: NA";
-    if (battery_cv > 0) {
+    char battery[32] = "BAT: NA";
+    if (usb_only) {
+        snprintf(battery, sizeof(battery), "USB ONLY");
+    } else if (battery_cv > 0) {
         snprintf(battery, sizeof(battery), "BAT: %d.%02d V %d%%",
                  battery_cv / 100, battery_cv % 100, battery_percent(battery_cv));
     }
@@ -220,8 +228,12 @@ void app_main(void)
     const TickType_t startup_screen_since = xTaskGetTickCount();
     ESP_ERROR_CHECK_WITHOUT_ABORT(radio_link_start());
 
-    const esp_err_t battery_init = init_battery_adc();
-    ESP_ERROR_CHECK_WITHOUT_ABORT(battery_init);
+    bool battery_ready = false;
+    if (!usb_only) {
+        const esp_err_t battery_init = init_battery_adc();
+        ESP_ERROR_CHECK_WITHOUT_ABORT(battery_init);
+        battery_ready = battery_init == ESP_OK;
+    }
     int battery_cv = 0;
     int shown_battery_cv = 0;
     TickType_t last_battery_sample = xTaskGetTickCount() - battery_poll_ticks;
@@ -268,7 +280,7 @@ void app_main(void)
 
         const bool scanning = mode == MODE_SCAN_GFSK || mode == MODE_SCAN_LORA;
         if (showing_status || scanning || now - startup_screen_since >= startup_screen_ticks) {
-            if (!scanning && battery_init == ESP_OK &&
+            if (!scanning && battery_ready &&
                 now - last_battery_sample >= battery_poll_ticks) {
                 battery_cv = read_battery_centivolts();
                 last_battery_sample = now;
