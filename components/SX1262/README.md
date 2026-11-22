@@ -31,8 +31,12 @@ SLAVE LINK reports valid requests; MASTER LINK reports validated replies.
 UART0 at 115200 baud logs counters, gaps, errors, RSSI, MASTER RX readiness and
 round-trip time, and SLAVE reply completion. Each valid receive produces
 a UART line with the packet's RSSI. The OLED shows a one-second RSSI average.
-Enable `LINK_LOG_PAYLOAD` for
-full payload hex dumps.
+UART writes run in the lower-priority `radio_uart` task. Queue overruns
+are reported in the next successfully queued line. Enable `LINK_LOG_PAYLOAD`
+for full payload hex dumps.
+
+The ESP32-S3 defaults to 240 MHz with a 1 ms FreeRTOS tick. The SLAVE
+uses a microsecond timer for its 2 ms response guard.
 
 ## Channel scans
 
