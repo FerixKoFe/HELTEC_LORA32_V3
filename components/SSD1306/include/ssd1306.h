@@ -6,8 +6,9 @@
 
 #include "esp_err.h"
 
-#define SSD1306_WIDTH 128
-#define SSD1306_HEIGHT 64
+/* Logical drawing area rotated 90 degrees clockwise relative to the panel. */
+#define SSD1306_WIDTH 64
+#define SSD1306_HEIGHT 128
 
 /* The board has one display. Serialize access if using multiple tasks. */
 esp_err_t ssd1306_init(void);
@@ -19,7 +20,7 @@ esp_err_t ssd1306_set_inverted(bool inverted);
 /* Drawing updates RAM. Call ssd1306_refresh() to send RAM to the OLED. */
 void ssd1306_clear(void);
 esp_err_t ssd1306_set_pixel(int x, int y, bool on);
-/* Copies a complete page-packed monochrome image into the framebuffer. */
+/* Copies a native 128x64 page-packed monochrome image into the framebuffer. */
 esp_err_t ssd1306_set_frame(const uint8_t *pixels, size_t size);
 esp_err_t ssd1306_refresh(void);
 /* Draws into RAM. The font includes status labels, digits, spaces, ':' and '-'. */

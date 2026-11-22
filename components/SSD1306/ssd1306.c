@@ -9,8 +9,8 @@
 #include "ssd1306.h"
 
 enum {
-    OLED_WIDTH = SSD1306_WIDTH,
-    OLED_HEIGHT = SSD1306_HEIGHT,
+    OLED_WIDTH = SSD1306_HEIGHT,
+    OLED_HEIGHT = SSD1306_WIDTH,
     OLED_SDA = GPIO_NUM_17,
     OLED_SCL = GPIO_NUM_18,
     OLED_RESET = GPIO_NUM_21,
@@ -64,19 +64,29 @@ static const uint8_t font['m' - ' ' + 1][GLYPH_WIDTH] = {
     ['U' - ' '] = {0x3F, 0x40, 0x40, 0x40, 0x3F},
     ['V' - ' '] = {0x0F, 0x30, 0x40, 0x30, 0x0F},
     ['W' - ' '] = {0x3F, 0x40, 0x38, 0x40, 0x3F},
+    ['X' - ' '] = {0x63, 0x14, 0x08, 0x14, 0x63},
     ['Y' - ' '] = {0x07, 0x08, 0x70, 0x08, 0x07},
     ['d' - ' '] = {0x38, 0x44, 0x44, 0x48, 0x7F},
     ['m' - ' '] = {0x7C, 0x04, 0x18, 0x04, 0x78},
 };
 
+static void write_pixel(int x, int y, bool on)
+{
+    const int column = OLED_WIDTH - 1 - y;
+    const int page = x / 8;
+    uint8_t *pixel_byte = frame + 1 + page * OLED_WIDTH + column;
+    const uint8_t mask = 1U << (x % 8);
+    *pixel_byte = on ? *pixel_byte | mask : *pixel_byte & ~mask;
+}
+
 static int text_width(const char *text, uint8_t scale)
 {
-    if (!text || !*text || scale == 0 || scale > OLED_HEIGHT / GLYPH_HEIGHT) {
+    if (!text || !*text || scale == 0 || scale > SSD1306_HEIGHT / GLYPH_HEIGHT) {
         return 0;
     }
     const size_t length = strlen(text);
     const int glyph_step = GLYPH_WIDTH + GLYPH_SPACING;
-    if (length > (size_t)(OLED_WIDTH / scale + GLYPH_SPACING) / glyph_step) {
+    if (length > (size_t)(SSD1306_WIDTH / scale + GLYPH_SPACING) / glyph_step) {
         return 0;
     }
     return ((int)length * glyph_step - GLYPH_SPACING) * scale;
@@ -87,8 +97,8 @@ esp_err_t ssd1306_draw_text(int left, int top, const char *text, uint8_t scale)
     const int width = text_width(text, scale);
     const int text_height = GLYPH_HEIGHT * scale;
     const int glyph_step = GLYPH_WIDTH + GLYPH_SPACING;
-    if (!width || left < 0 || left > OLED_WIDTH - width ||
-        top < 0 || top > OLED_HEIGHT - text_height) {
+    if (!width || left < 0 || left > SSD1306_WIDTH - width ||
+        top < 0 || top > SSD1306_HEIGHT - text_height) {
         return ESP_ERR_INVALID_ARG;
     }
     for (const char *character = text; *character; ++character) {
@@ -98,15 +108,12 @@ esp_err_t ssd1306_draw_text(int left, int top, const char *text, uint8_t scale)
     }
 
     for (int y = 0; y < text_height; ++y) {
-        const int display_y = top + y;
-        uint8_t *page = frame + 1 + (display_y / 8) * OLED_WIDTH;
-        const uint8_t pixel_mask = 1U << (display_y % 8);
         for (int glyph = 0; text[glyph]; ++glyph) {
             const uint8_t *bitmap = font[text[glyph] - ' '];
             const int x = left + glyph * glyph_step * scale;
             for (int column = 0; column < GLYPH_WIDTH * scale; ++column) {
                 if (bitmap[column / scale] & (1U << (y / scale))) {
-                    page[x + column] |= pixel_mask;
+                    write_pixel(x + column, top + y, true);
                 }
             }
         }
@@ -124,8 +131,8 @@ esp_err_t ssd1306_show_centered_text(const char *text, uint8_t scale)
         ESP_RETURN_ON_ERROR(ssd1306_init(), TAG, "OLED initialization failed");
     }
     ssd1306_clear();
-    ESP_RETURN_ON_ERROR(ssd1306_draw_text((OLED_WIDTH - width) / 2,
-                                        (OLED_HEIGHT - GLYPH_HEIGHT * scale) / 2,
+    ESP_RETURN_ON_ERROR(ssd1306_draw_text((SSD1306_WIDTH - width) / 2,
+                                        (SSD1306_HEIGHT - GLYPH_HEIGHT * scale) / 2,
                                         text, scale), TAG, "Text drawing failed");
     ESP_RETURN_ON_ERROR(ssd1306_refresh(), TAG, "Frame transfer failed");
     return ssd1306_set_enabled(true);
@@ -164,12 +171,10 @@ void ssd1306_clear(void)
 
 esp_err_t ssd1306_set_pixel(int x, int y, bool on)
 {
-    if (x < 0 || x >= OLED_WIDTH || y < 0 || y >= OLED_HEIGHT) {
+    if (x < 0 || x >= SSD1306_WIDTH || y < 0 || y >= SSD1306_HEIGHT) {
         return ESP_ERR_INVALID_ARG;
     }
-    uint8_t *pixel_byte = frame + 1 + (y / 8) * OLED_WIDTH + x;
-    const uint8_t mask = 1U << (y % 8);
-    *pixel_byte = on ? *pixel_byte | mask : *pixel_byte & ~mask;
+    write_pixel(x, y, on);
     return ESP_OK;
 }
 
@@ -274,5 +279,5 @@ esp_err_t ssd1306_deinit(void)
 
 esp_err_t ssd1306_show_hello(void)
 {
-    return ssd1306_show_centered_text("HELLO", 4);
+    return ssd1306_show_centered_text("HELLO", 2);
 }

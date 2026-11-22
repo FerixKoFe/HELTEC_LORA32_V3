@@ -147,7 +147,7 @@ static void draw_activity_box(int left, bool active)
     for (int y = 0; y < 14; ++y) {
         for (int x = 0; x < 10; ++x) {
             if (active || x == 0 || x == 9 || y == 0 || y == 13) {
-                ssd1306_set_pixel(left + x, 2 + y, true);
+                ssd1306_set_pixel(left + x, 17 + y, true);
             }
         }
     }
@@ -156,30 +156,35 @@ static void draw_activity_box(int left, bool active)
 static esp_err_t show_status(system_mode_t mode, radio_link_status_t link,
                              bool tx_active, bool rx_active, int battery_cv)
 {
-    char rssi[24] = "RSSI: NA";
+    char rssi[16] = "NA";
     if (link.connected) {
         /* Round the half-dBm reading to a whole dBm for the display. */
         const int dbm = (link.rssi_dbm_x2 - 1) / 2;
-        snprintf(rssi, sizeof(rssi), "RSSI: %d dBm %d%%", dbm, rssi_percent(link.rssi_dbm_x2));
+        snprintf(rssi, sizeof(rssi), "%d  %d%%", dbm, rssi_percent(link.rssi_dbm_x2));
     }
     ssd1306_clear();
-    ESP_RETURN_ON_ERROR(ssd1306_draw_text(2, 2, mode == MODE_MASTER ? "MASTER" : "SLAVE", 2),
+    ESP_RETURN_ON_ERROR(ssd1306_draw_text(2, 4, mode == MODE_MASTER ? "MASTER" : "SLAVE", 1),
                         TAG, "Mode label failed");
-    draw_activity_box(SSD1306_WIDTH - 24, tx_active);
-    draw_activity_box(SSD1306_WIDTH - 12, rx_active);
-    ESP_RETURN_ON_ERROR(ssd1306_draw_text(2, 21, rssi, 1), TAG, "RSSI label failed");
-    char missed[24];
-    snprintf(missed, sizeof(missed), "MISS: %" PRIu32, link.missed_packets);
-    ESP_RETURN_ON_ERROR(ssd1306_draw_text(2, 30, missed, 1), TAG, "Missing packet label failed");
-    char battery[32] = "BAT: NA";
+    draw_activity_box(2, tx_active);
+    draw_activity_box(34, rx_active);
+    ESP_RETURN_ON_ERROR(ssd1306_draw_text(15, 21, "TX", 1), TAG, "TX label failed");
+    ESP_RETURN_ON_ERROR(ssd1306_draw_text(47, 21, "RX", 1), TAG, "RX label failed");
+    ESP_RETURN_ON_ERROR(ssd1306_draw_text(2, 39, "RSSI dBm", 1), TAG, "RSSI label failed");
+    ESP_RETURN_ON_ERROR(ssd1306_draw_text(2, 50, rssi, 1), TAG, "RSSI value failed");
+    char missed[16];
+    snprintf(missed, sizeof(missed), "%" PRIu32, link.missed_packets);
+    ESP_RETURN_ON_ERROR(ssd1306_draw_text(2, 66, "MISS", 1), TAG, "Missing packet label failed");
+    ESP_RETURN_ON_ERROR(ssd1306_draw_text(2, 76, missed, 1), TAG, "Missing packet value failed");
+    char battery[16] = "NA";
     if (usb_only) {
         snprintf(battery, sizeof(battery), "USB ONLY");
     } else if (battery_cv > 0) {
-        snprintf(battery, sizeof(battery), "BAT: %d.%02d V %d%%",
+        snprintf(battery, sizeof(battery), "%d.%02dV %d%%",
                  battery_cv / 100, battery_cv % 100, battery_percent(battery_cv));
     }
-    ESP_RETURN_ON_ERROR(ssd1306_draw_text(2, 39, battery, 1), TAG, "Battery label failed");
-    ESP_RETURN_ON_ERROR(ssd1306_draw_text(2, 50, link.connected ? "LINK: UP" : "LINK: DOWN", 2),
+    ESP_RETURN_ON_ERROR(ssd1306_draw_text(2, 91, "BAT", 1), TAG, "Battery label failed");
+    ESP_RETURN_ON_ERROR(ssd1306_draw_text(2, 102, battery, 1), TAG, "Battery value failed");
+    ESP_RETURN_ON_ERROR(ssd1306_draw_text(2, 118, link.connected ? "LINK: UP" : "LINK: DOWN", 1),
                         TAG, "Link label failed");
     return ssd1306_refresh();
 }
@@ -193,13 +198,14 @@ static esp_err_t show_scan(system_mode_t mode, radio_link_status_t link)
         snprintf(time, sizeof(time), "LEFT: %u S", (unsigned)link.scan_seconds_left);
     }
     ssd1306_clear();
-    const char *title = mode == MODE_SCAN_GFSK ? "GFSK SCAN" : "LORA SCAN";
-    ESP_RETURN_ON_ERROR(ssd1306_draw_text(2, 2, title, 2), TAG, "Scan title failed");
-    ESP_RETURN_ON_ERROR(ssd1306_draw_text(2, 23, percent, 2), TAG, "Scan progress failed");
-    ESP_RETURN_ON_ERROR(ssd1306_draw_text(2, 43, time, 1), TAG, "Scan time failed");
+    const char *title = mode == MODE_SCAN_GFSK ? "GFSK" : "LORA";
+    ESP_RETURN_ON_ERROR(ssd1306_draw_text(9, 8, title, 2), TAG, "Scan mode failed");
+    ESP_RETURN_ON_ERROR(ssd1306_draw_text(20, 29, "SCAN", 1), TAG, "Scan title failed");
+    ESP_RETURN_ON_ERROR(ssd1306_draw_text(9, 49, percent, 2), TAG, "Scan progress failed");
+    ESP_RETURN_ON_ERROR(ssd1306_draw_text(2, 76, time, 1), TAG, "Scan time failed");
     if (link.scan_state == SCAN_DONE || link.scan_state == SCAN_ERROR) {
         const char *result = link.scan_state == SCAN_DONE ? "DONE" : "SCAN ERROR";
-        ESP_RETURN_ON_ERROR(ssd1306_draw_text(2, 54, result, 1), TAG, "Scan result failed");
+        ESP_RETURN_ON_ERROR(ssd1306_draw_text(2, 94, result, 1), TAG, "Scan result failed");
     }
     return ssd1306_refresh();
 }
@@ -224,7 +230,7 @@ void app_main(void)
     bool last_sample = stable_pressed;
     TickType_t last_change = xTaskGetTickCount();
     system_mode_t mode = MODE_MASTER;
-    ESP_ERROR_CHECK_WITHOUT_ABORT(ssd1306_show_centered_text("MASTER", 3));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(ssd1306_show_centered_text("MASTER", 1));
     const TickType_t startup_screen_since = xTaskGetTickCount();
     ESP_ERROR_CHECK_WITHOUT_ABORT(radio_link_start());
 
