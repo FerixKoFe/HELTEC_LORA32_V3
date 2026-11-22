@@ -1,0 +1,26 @@
+menu "GFSK radio link"
+
+config LINK_FREQUENCY_HZ
+    int "Link frequency (Hz)"
+    range 150000000 960000000
+    default 869525000
+    help
+        Set both boards to the same frequency supported by the board and region.
+
+config LINK_TX_POWER_DBM
+    int "Link transmit power (dBm)"
+    range -9 22
+    default 22
+
+endmenu
+
+menu "Heltec battery measurement"
+
+config HELTEC_BATTERY_ADC_ACTIVE_HIGH
+    bool "Active-high ADC_Ctrl (Heltec WiFi LoRa 32 V3.2)"
+    default n
+    help
+        Enable for the V3.2 board revision. V3.0 and V3.1 use active-low
+        battery measurement control.
+
+endmenu

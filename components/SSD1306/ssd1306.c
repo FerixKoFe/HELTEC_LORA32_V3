@@ -20,7 +20,6 @@ enum {
     GLYPH_WIDTH = 5,
     GLYPH_HEIGHT = 7,
     GLYPH_SPACING = 1,
-    GLYPH_SCALE = 4,
 };
 
 static const char *const TAG = "ssd1306";
@@ -29,35 +28,106 @@ static i2c_master_dev_handle_t display;
 static uint8_t frame[1 + OLED_WIDTH * OLED_HEIGHT / 8] = {0x40};
 
 /* Each byte is a column, with the least significant bit at the top. */
-static const uint8_t hello[][GLYPH_WIDTH] = {
-    {0x7F, 0x08, 0x08, 0x08, 0x7F}, /* H */
-    {0x7F, 0x49, 0x49, 0x49, 0x41}, /* E */
-    {0x7F, 0x40, 0x40, 0x40, 0x40}, /* L */
-    {0x7F, 0x40, 0x40, 0x40, 0x40}, /* L */
-    {0x3E, 0x41, 0x41, 0x41, 0x3E}, /* O */
+static const uint8_t font['m' - ' ' + 1][GLYPH_WIDTH] = {
+    ['%' - ' '] = {0x63, 0x13, 0x08, 0x64, 0x63},
+    ['-' - ' '] = {0x08, 0x08, 0x08, 0x08, 0x08},
+    ['.' - ' '] = {0, 0, 0x60, 0, 0},
+    [':' - ' '] = {0, 0, 0x24, 0, 0},
+    ['0' - ' '] = {0x3E, 0x51, 0x49, 0x45, 0x3E},
+    ['1' - ' '] = {0x00, 0x42, 0x7F, 0x40, 0x00},
+    ['2' - ' '] = {0x42, 0x61, 0x51, 0x49, 0x46},
+    ['3' - ' '] = {0x21, 0x41, 0x45, 0x4B, 0x31},
+    ['4' - ' '] = {0x18, 0x14, 0x12, 0x7F, 0x10},
+    ['5' - ' '] = {0x27, 0x45, 0x45, 0x45, 0x39},
+    ['6' - ' '] = {0x3C, 0x4A, 0x49, 0x49, 0x30},
+    ['7' - ' '] = {0x01, 0x71, 0x09, 0x05, 0x03},
+    ['8' - ' '] = {0x36, 0x49, 0x49, 0x49, 0x36},
+    ['9' - ' '] = {0x06, 0x49, 0x49, 0x29, 0x1E},
+    ['A' - ' '] = {0x7E, 0x09, 0x09, 0x09, 0x7E},
+    ['B' - ' '] = {0x7F, 0x49, 0x49, 0x49, 0x36},
+    ['C' - ' '] = {0x3E, 0x41, 0x41, 0x41, 0x22},
+    ['D' - ' '] = {0x7F, 0x41, 0x41, 0x22, 0x1C},
+    ['E' - ' '] = {0x7F, 0x49, 0x49, 0x49, 0x41},
+    ['F' - ' '] = {0x7F, 0x09, 0x09, 0x09, 0x01},
+    ['G' - ' '] = {0x3E, 0x41, 0x49, 0x49, 0x7A},
+    ['H' - ' '] = {0x7F, 0x08, 0x08, 0x08, 0x7F},
+    ['I' - ' '] = {0x00, 0x41, 0x7F, 0x41, 0x00},
+    ['K' - ' '] = {0x7F, 0x08, 0x14, 0x22, 0x41},
+    ['L' - ' '] = {0x7F, 0x40, 0x40, 0x40, 0x40},
+    ['M' - ' '] = {0x7F, 0x02, 0x0C, 0x02, 0x7F},
+    ['N' - ' '] = {0x7F, 0x04, 0x08, 0x10, 0x7F},
+    ['O' - ' '] = {0x3E, 0x41, 0x41, 0x41, 0x3E},
+    ['P' - ' '] = {0x7F, 0x09, 0x09, 0x09, 0x06},
+    ['R' - ' '] = {0x7F, 0x09, 0x19, 0x29, 0x46},
+    ['S' - ' '] = {0x46, 0x49, 0x49, 0x49, 0x31},
+    ['T' - ' '] = {0x01, 0x01, 0x7F, 0x01, 0x01},
+    ['U' - ' '] = {0x3F, 0x40, 0x40, 0x40, 0x3F},
+    ['V' - ' '] = {0x0F, 0x30, 0x40, 0x30, 0x0F},
+    ['W' - ' '] = {0x3F, 0x40, 0x38, 0x40, 0x3F},
+    ['d' - ' '] = {0x38, 0x44, 0x44, 0x48, 0x7F},
+    ['m' - ' '] = {0x7C, 0x04, 0x18, 0x04, 0x78},
 };
 
-static void draw_hello(uint8_t *pixels)
+static int text_width(const char *text, uint8_t scale)
 {
-    const int glyph_count = sizeof(hello) / sizeof(hello[0]);
-    const int text_width = (glyph_count * (GLYPH_WIDTH + GLYPH_SPACING)
-                            - GLYPH_SPACING) * GLYPH_SCALE;
-    const int left = (OLED_WIDTH - text_width) / 2;
-    const int top = (OLED_HEIGHT - GLYPH_HEIGHT * GLYPH_SCALE) / 2;
+    if (!text || !*text || scale == 0 || scale > OLED_HEIGHT / GLYPH_HEIGHT) {
+        return 0;
+    }
+    const size_t length = strlen(text);
+    const int glyph_step = GLYPH_WIDTH + GLYPH_SPACING;
+    if (length > (size_t)(OLED_WIDTH / scale + GLYPH_SPACING) / glyph_step) {
+        return 0;
+    }
+    return ((int)length * glyph_step - GLYPH_SPACING) * scale;
+}
 
-    for (int y = 0; y < GLYPH_HEIGHT * GLYPH_SCALE; ++y) {
+esp_err_t ssd1306_draw_text(int left, int top, const char *text, uint8_t scale)
+{
+    const int width = text_width(text, scale);
+    const int text_height = GLYPH_HEIGHT * scale;
+    const int glyph_step = GLYPH_WIDTH + GLYPH_SPACING;
+    if (!width || left < 0 || left > OLED_WIDTH - width ||
+        top < 0 || top > OLED_HEIGHT - text_height) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    for (const char *character = text; *character; ++character) {
+        if (*character < ' ' || *character > 'm') {
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
+
+    for (int y = 0; y < text_height; ++y) {
         const int display_y = top + y;
-        uint8_t *page = pixels + (display_y / 8) * OLED_WIDTH;
+        uint8_t *page = frame + 1 + (display_y / 8) * OLED_WIDTH;
         const uint8_t pixel_mask = 1U << (display_y % 8);
-        for (int glyph = 0; glyph < glyph_count; ++glyph) {
-            const int x = left + glyph * (GLYPH_WIDTH + GLYPH_SPACING) * GLYPH_SCALE;
-            for (int column = 0; column < GLYPH_WIDTH * GLYPH_SCALE; ++column) {
-                if (hello[glyph][column / GLYPH_SCALE] & (1U << (y / GLYPH_SCALE))) {
+        for (int glyph = 0; text[glyph]; ++glyph) {
+            const uint8_t *bitmap = font[text[glyph] - ' '];
+            const int x = left + glyph * glyph_step * scale;
+            for (int column = 0; column < GLYPH_WIDTH * scale; ++column) {
+                if (bitmap[column / scale] & (1U << (y / scale))) {
                     page[x + column] |= pixel_mask;
                 }
             }
         }
     }
+    return ESP_OK;
+}
+
+esp_err_t ssd1306_show_centered_text(const char *text, uint8_t scale)
+{
+    const int width = text_width(text, scale);
+    if (!width) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!display) {
+        ESP_RETURN_ON_ERROR(ssd1306_init(), TAG, "OLED initialization failed");
+    }
+    ssd1306_clear();
+    ESP_RETURN_ON_ERROR(ssd1306_draw_text((OLED_WIDTH - width) / 2,
+                                        (OLED_HEIGHT - GLYPH_HEIGHT * scale) / 2,
+                                        text, scale), TAG, "Text drawing failed");
+    ESP_RETURN_ON_ERROR(ssd1306_refresh(), TAG, "Frame transfer failed");
+    return ssd1306_set_enabled(true);
 }
 
 static esp_err_t send_bytes(const uint8_t *bytes, size_t size)
@@ -203,11 +273,5 @@ esp_err_t ssd1306_deinit(void)
 
 esp_err_t ssd1306_show_hello(void)
 {
-    if (!display) {
-        ESP_RETURN_ON_ERROR(ssd1306_init(), TAG, "OLED initialization failed");
-    }
-    ssd1306_clear();
-    draw_hello(frame + 1);
-    ESP_RETURN_ON_ERROR(ssd1306_refresh(), TAG, "Frame transfer failed");
-    return ssd1306_set_enabled(true);
+    return ssd1306_show_centered_text("HELLO", 4);
 }

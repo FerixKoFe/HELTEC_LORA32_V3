@@ -22,4 +22,8 @@ esp_err_t ssd1306_set_pixel(int x, int y, bool on);
 /* Copies a complete page-packed monochrome image into the framebuffer. */
 esp_err_t ssd1306_set_frame(const uint8_t *pixels, size_t size);
 esp_err_t ssd1306_refresh(void);
+/* Draws into RAM. The font includes status labels, digits, spaces, ':' and '-'. */
+esp_err_t ssd1306_draw_text(int x, int y, const char *text, uint8_t scale);
+/* Clears RAM, draws centered text, and refreshes the display. */
+esp_err_t ssd1306_show_centered_text(const char *text, uint8_t scale);
 esp_err_t ssd1306_show_hello(void);
