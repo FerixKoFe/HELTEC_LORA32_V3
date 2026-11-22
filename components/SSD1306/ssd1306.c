@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <string.h>
 
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
@@ -8,8 +9,8 @@
 #include "ssd1306.h"
 
 enum {
-    OLED_WIDTH = 128,
-    OLED_HEIGHT = 64,
+    OLED_WIDTH = SSD1306_WIDTH,
+    OLED_HEIGHT = SSD1306_HEIGHT,
     OLED_SDA = GPIO_NUM_17,
     OLED_SCL = GPIO_NUM_18,
     OLED_RESET = GPIO_NUM_21,
@@ -23,6 +24,9 @@ enum {
 };
 
 static const char *const TAG = "ssd1306";
+static i2c_master_bus_handle_t bus;
+static i2c_master_dev_handle_t display;
+static uint8_t frame[1 + OLED_WIDTH * OLED_HEIGHT / 8] = {0x40};
 
 /* Each byte is a column, with the least significant bit at the top. */
 static const uint8_t hello[][GLYPH_WIDTH] = {
@@ -56,7 +60,70 @@ static void draw_hello(uint8_t *pixels)
     }
 }
 
-static esp_err_t write_display(i2c_master_dev_handle_t display)
+static esp_err_t send_bytes(const uint8_t *bytes, size_t size)
+{
+    if (!display) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return i2c_master_transmit(display, bytes, size, I2C_TIMEOUT_MS);
+}
+
+esp_err_t ssd1306_set_enabled(bool enabled)
+{
+    const uint8_t command[] = {0x00, enabled ? 0xAF : 0xAE};
+    return send_bytes(command, sizeof(command));
+}
+
+esp_err_t ssd1306_set_contrast(uint8_t contrast)
+{
+    const uint8_t command[] = {0x00, 0x81, contrast};
+    return send_bytes(command, sizeof(command));
+}
+
+esp_err_t ssd1306_set_inverted(bool inverted)
+{
+    const uint8_t command[] = {0x00, inverted ? 0xA7 : 0xA6};
+    return send_bytes(command, sizeof(command));
+}
+
+void ssd1306_clear(void)
+{
+    memset(frame + 1, 0, sizeof(frame) - 1);
+}
+
+esp_err_t ssd1306_set_pixel(int x, int y, bool on)
+{
+    if (x < 0 || x >= OLED_WIDTH || y < 0 || y >= OLED_HEIGHT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint8_t *pixel_byte = frame + 1 + (y / 8) * OLED_WIDTH + x;
+    const uint8_t mask = 1U << (y % 8);
+    *pixel_byte = on ? *pixel_byte | mask : *pixel_byte & ~mask;
+    return ESP_OK;
+}
+
+esp_err_t ssd1306_refresh(void)
+{
+    static const uint8_t address[] = {
+        0x00, 0x21, 0x00, OLED_WIDTH - 1, 0x22, 0x00, OLED_HEIGHT / 8 - 1,
+    };
+    ESP_RETURN_ON_ERROR(send_bytes(address, sizeof(address)), TAG, "Address setup failed");
+    return send_bytes(frame, sizeof(frame));
+}
+
+esp_err_t ssd1306_set_frame(const uint8_t *pixels, size_t size)
+{
+    if (!pixels) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (size != sizeof(frame) - 1) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    memcpy(frame + 1, pixels, size);
+    return ESP_OK;
+}
+
+static esp_err_t configure_display(void)
 {
     static const uint8_t setup[] = {
         0x00,       /* Command stream */
@@ -73,22 +140,15 @@ static esp_err_t write_display(i2c_master_dev_handle_t display)
         0xD9, 0xF1, /* Pre-charge period */
         0xDB, 0x40, /* VCOMH level */
         0xA4, 0xA6, /* Show RAM in normal polarity */
-        0x21, 0x00, OLED_WIDTH - 1,
-        0x22, 0x00, OLED_HEIGHT / 8 - 1,
     };
-    static const uint8_t display_on[] = {0x00, 0xAF};
-    uint8_t frame[1 + OLED_WIDTH * OLED_HEIGHT / 8] = {0x40};
-    draw_hello(frame + 1);
-
-    ESP_RETURN_ON_ERROR(i2c_master_transmit(display, setup, sizeof(setup), I2C_TIMEOUT_MS),
-                        TAG, "Display setup failed");
-    ESP_RETURN_ON_ERROR(i2c_master_transmit(display, frame, sizeof(frame), I2C_TIMEOUT_MS),
-                        TAG, "Frame transfer failed");
-    return i2c_master_transmit(display, display_on, sizeof(display_on), I2C_TIMEOUT_MS);
+    return send_bytes(setup, sizeof(setup));
 }
 
-esp_err_t ssd1306_show_hello(void)
+esp_err_t ssd1306_init(void)
 {
+    if (bus) {
+        return ESP_ERR_INVALID_STATE;
+    }
     const gpio_config_t outputs = {
         .pin_bit_mask = (1ULL << OLED_RESET) | (1ULL << OLED_VEXT),
         .mode = GPIO_MODE_OUTPUT,
@@ -113,16 +173,41 @@ esp_err_t ssd1306_show_hello(void)
         .device_address = OLED_ADDRESS,
         .scl_speed_hz = 100000,
     };
-    i2c_master_bus_handle_t bus;
     ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bus_config, &bus), TAG, "Could not open I2C bus");
 
-    i2c_master_dev_handle_t display;
     esp_err_t result = i2c_master_bus_add_device(bus, &device_config, &display);
     if (result == ESP_OK) {
-        result = write_display(display);
-        ESP_ERROR_CHECK_WITHOUT_ABORT(i2c_master_bus_rm_device(display));
+        result = configure_display();
     }
-    /* The controller retains its frame after the startup transfer. */
-    ESP_ERROR_CHECK_WITHOUT_ABORT(i2c_del_master_bus(bus));
+    if (result != ESP_OK) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(ssd1306_deinit());
+    }
     return result;
+}
+
+esp_err_t ssd1306_deinit(void)
+{
+    if (!bus) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t result = ESP_OK;
+    if (display) {
+        result = ssd1306_set_enabled(false);
+        ESP_RETURN_ON_ERROR(i2c_master_bus_rm_device(display), TAG, "Could not remove OLED");
+        display = NULL;
+    }
+    ESP_RETURN_ON_ERROR(i2c_del_master_bus(bus), TAG, "Could not release I2C bus");
+    bus = NULL;
+    return result;
+}
+
+esp_err_t ssd1306_show_hello(void)
+{
+    if (!display) {
+        ESP_RETURN_ON_ERROR(ssd1306_init(), TAG, "OLED initialization failed");
+    }
+    ssd1306_clear();
+    draw_hello(frame + 1);
+    ESP_RETURN_ON_ERROR(ssd1306_refresh(), TAG, "Frame transfer failed");
+    return ssd1306_set_enabled(true);
 }
