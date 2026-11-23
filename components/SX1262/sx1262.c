@@ -191,13 +191,42 @@ esp_err_t sx1262_sleep(void)
     return ESP_OK;
 }
 
+static uint32_t calibrated_low_hz;
+static uint32_t calibrated_high_hz;
+
+static esp_err_t program_frequency(uint32_t hz)
+{
+    const uint32_t pll = ((uint64_t)hz << 25) / 32000000;
+    return WRITE(SET_FREQUENCY, pll >> 24, pll >> 16, pll >> 8, pll);
+}
+
 static esp_err_t set_frequency(uint32_t hz)
 {
     /* Calibrate over a narrow window around the actual frequency (4 MHz units). */
     const uint32_t mhz = hz / 1000000;
-    CHECK(WRITE(CALIBRATE_IMAGE, (mhz - 4) / 4, (mhz + 8) / 4));
-    const uint32_t pll = ((uint64_t)hz << 25) / 32000000;
-    return WRITE(SET_FREQUENCY, pll >> 24, pll >> 16, pll >> 8, pll);
+    const uint8_t low = (mhz - 4) / 4;
+    const uint8_t high = (mhz + 8) / 4;
+    CHECK(WRITE(CALIBRATE_IMAGE, low, high));
+    CHECK(program_frequency(hz));
+    calibrated_low_hz = low * 4000000U;
+    calibrated_high_hz = high * 4000000U;
+    return ESP_OK;
+}
+
+esp_err_t sx1262_retune(uint32_t frequency_hz)
+{
+    if (!configured) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (frequency_hz < calibrated_low_hz || frequency_hz > calibrated_high_hz) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (frequency_hz != current.frequency_hz) {
+        CHECK(set_standby(1));
+        CHECK(program_frequency(frequency_hz));
+        current.frequency_hz = frequency_hz;
+    }
+    return ESP_OK;
 }
 
 static esp_err_t packet_params(const sx1262_config_t *config, uint8_t length)

@@ -10,22 +10,28 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
-#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"
 #include "sx1262.h"
 
 enum {
     DATA_LENGTH = 50,
-    ALIVE_OFFSET = DATA_LENGTH,
     FRAME_LENGTH = DATA_LENGTH + 1,
+    FHSS_DATA_LENGTH = 40,
+    FHSS_METADATA_OFFSET = FHSS_DATA_LENGTH + 1,
+    FHSS_FRAME_LENGTH = FHSS_METADATA_OFFSET + 8,
+    FHSS_SLOT_MS = 20,
+    FHSS_SLOT_US = FHSS_SLOT_MS * 1000,
+    FHSS_MAX_TX_LATENESS_US = 3000,
+    FHSS_RX_GUARD_US = 3000,
+    FHSS_SYNC_INTERVAL = 4,
+    FHSS_HOLDOVER_US = 6 * FHSS_SLOT_US,
+    FHSS_SYNC_HZ = 869525000,
     CYCLE_MS = 20,
     RX_WINDOW_MS = (CYCLE_MS * 110 + 99) / 100,
-    LINK_EXPIRY_MS = 3 * CYCLE_MS,
     RSSI_AVERAGE_MS = 1000,
     RX_SLICE_MS = 2,
     TX_TIMEOUT_MS = 12,
-    SLAVE_TURNAROUND_US = 2000,
     UART_LOG_QUEUE_DEPTH = 32,
 };
 
@@ -34,15 +40,28 @@ typedef struct {
     radio_link_status_t status;
 } link_sample_t;
 
+_Static_assert(FHSS_FRAME_LENGTH <= SX1262_GFSK_DEFAULT_MAX_PAYLOAD_LENGTH,
+               "FHSS frame exceeds radio payload limit");
+
+static const uint32_t fhss_channels[] = {868100000, 868300000, 868500000};
+_Static_assert(sizeof(fhss_channels) / sizeof(fhss_channels[0]) == FHSS_SYNC_INTERVAL - 1,
+               "Each FHSS group must visit every data channel");
+
+typedef struct {
+    uint32_t session;
+    uint32_t slot;
+    int64_t time_us;
+    bool synchronized;
+} fhss_state_t;
+
 typedef struct {
     radio_link_status_t status;
     TickType_t last_rx;
-    bool have_counter;
-    uint8_t last_counter;
-    uint32_t cycle;
-    uint32_t last_good_cycle;
-    TickType_t slave_window_start;
-    uint32_t slave_timed_misses;
+    TickType_t down_window_start;
+    uint8_t last_sequence;
+    uint8_t next_sequence;
+    fhss_state_t fhss;
+    uint32_t fhss_logged_frequency_hz;
     TickType_t rssi_window_start;
     int32_t rssi_sum_x2;
     int32_t rssi_samples;
@@ -52,11 +71,8 @@ static const char *const TAG = "radio_link";
 static QueueHandle_t requests;
 static QueueHandle_t samples;
 static QueueHandle_t uart_logs;
-static SemaphoreHandle_t reply_ready;
-static esp_timer_handle_t reply_timer;
 static uint32_t generation;
-static portMUX_TYPE activity_lock = portMUX_INITIALIZER_UNLOCKED;
-static unsigned activity;
+static portMUX_TYPE generation_lock = portMUX_INITIALIZER_UNLOCKED;
 
 typedef struct {
     uint32_t timestamp_ms;
@@ -100,41 +116,93 @@ static void uart_log_task(void *argument)
     }
 }
 
-static void reply_timer_elapsed(void *argument)
-{
-    (void)argument;
-    xSemaphoreGive(reply_ready);
-}
-
-static void wait_for_reply_slot(int64_t received_us)
-{
-    const int64_t remaining_us = received_us + SLAVE_TURNAROUND_US - esp_timer_get_time();
-    if (remaining_us <= 0) {
-        return;
-    }
-    if (esp_timer_start_once(reply_timer, remaining_us) == ESP_OK) {
-        xSemaphoreTake(reply_ready, portMAX_DELAY);
-    } else {
-        vTaskDelay(pdMS_TO_TICKS(SLAVE_TURNAROUND_US / 1000) + 1);
-    }
-}
-
-static void record_activity(unsigned event)
-{
-    portENTER_CRITICAL(&activity_lock);
-    activity |= event;
-    portEXIT_CRITICAL(&activity_lock);
-}
-
 const char *radio_link_mode_name(system_mode_t mode)
 {
     switch (mode) {
     case MODE_MASTER: return "MASTER";
     case MODE_SLAVE: return "SLAVE";
+    case MODE_M_FHSS: return "M_FHSS";
+    case MODE_S_FHSS: return "S_FHSS";
     case MODE_SCAN_GFSK: return "GFSK";
     case MODE_SCAN_LORA: return "LORA";
     }
     return "UNKNOWN";
+}
+
+static bool is_fhss(system_mode_t mode)
+{
+    return mode == MODE_M_FHSS || mode == MODE_S_FHSS;
+}
+
+static bool is_master(system_mode_t mode)
+{
+    return mode == MODE_MASTER || mode == MODE_M_FHSS;
+}
+
+static size_t data_length(system_mode_t mode)
+{
+    return is_fhss(mode) ? FHSS_DATA_LENGTH : DATA_LENGTH;
+}
+
+static size_t frame_length(system_mode_t mode)
+{
+    return is_fhss(mode) ? FHSS_FRAME_LENGTH : FRAME_LENGTH;
+}
+
+static unsigned cycle_ms(system_mode_t mode)
+{
+    return is_fhss(mode) ? FHSS_SLOT_MS : CYCLE_MS;
+}
+
+static uint32_t fhss_frequency(uint32_t session, uint32_t slot)
+{
+    const unsigned position = slot % FHSS_SYNC_INTERVAL;
+    if (position == 0) {
+        return FHSS_SYNC_HZ;
+    }
+
+    // Choose a permutation for each group, visiting each data channel once.
+    uint32_t mixed = session ^ (slot / FHSS_SYNC_INTERVAL);
+    mixed ^= mixed >> 16;
+    mixed *= UINT32_C(0x7feb352d);
+    mixed ^= mixed >> 15;
+    const unsigned start = mixed % 3;
+    const unsigned step = (mixed & 1U) + 1;
+    return fhss_channels[(start + (position - 1) * step) % 3];
+}
+
+static esp_err_t fhss_retune(system_mode_t mode, link_state_t *state, uint32_t slot)
+{
+    const uint32_t frequency_hz = fhss_frequency(state->fhss.session, slot);
+    const esp_err_t result = sx1262_retune(frequency_hz);
+    if (result == ESP_OK && frequency_hz != state->fhss_logged_frequency_hz) {
+        state->fhss_logged_frequency_hz = frequency_hz;
+        radio_link_queue_log(ESP_LOG_INFO, "%s freq=%" PRIu32 " Hz",
+                             radio_link_mode_name(mode), frequency_hz);
+    }
+    return result;
+}
+
+static void write_u32(uint8_t *field, uint32_t value)
+{
+    for (unsigned i = 0; i < 4; ++i) {
+        field[i] = (uint8_t)(value >> (8 * i));
+    }
+}
+
+static uint32_t read_u32(const uint8_t *field)
+{
+    uint32_t value = 0;
+    for (unsigned i = 0; i < 4; ++i) {
+        value |= (uint32_t)field[i] << (8 * i);
+    }
+    return value;
+}
+
+static uint32_t fhss_slot_at(const fhss_state_t *fhss, int64_t now_us)
+{
+    // Switch halfway between predicted packet arrivals, including after loss.
+    return fhss->slot + (now_us - fhss->time_us + FHSS_SLOT_US / 2) / FHSS_SLOT_US;
 }
 
 #ifdef CONFIG_LINK_LOG_PAYLOAD
@@ -143,13 +211,14 @@ static void log_frame(system_mode_t mode, const char *direction,
 {
     static const char hex[] = "0123456789ABCDEF";
     char data[DATA_LENGTH * 2 + 1];
-    for (size_t i = 0; i < DATA_LENGTH; ++i) {
+    const size_t length = data_length(mode);
+    for (size_t i = 0; i < length; ++i) {
         data[2 * i] = hex[frame[i] >> 4];
         data[2 * i + 1] = hex[frame[i] & 0x0F];
     }
-    data[sizeof(data) - 1] = '\0';
-    radio_link_queue_log(ESP_LOG_INFO, "%s %s alive=%u data=%s", radio_link_mode_name(mode), direction,
-             (unsigned)frame[ALIVE_OFFSET], data);
+    data[length * 2] = '\0';
+    radio_link_queue_log(ESP_LOG_INFO, "%s %s seq=%u data=%s", radio_link_mode_name(mode), direction,
+             (unsigned)frame[length], data);
 }
 #else
 #define log_frame(mode, direction, frame) ((void)0)
@@ -181,211 +250,283 @@ static void publish_rssi_average(const mode_request_t *request, link_state_t *st
 
 static void expire_link(const mode_request_t *request, link_state_t *state)
 {
+    const TickType_t now = xTaskGetTickCount();
+    const unsigned expiry_ms = 3 * cycle_ms(request->mode);
     if (state->status.connected &&
-        xTaskGetTickCount() - state->last_rx >= pdMS_TO_TICKS(LINK_EXPIRY_MS)) {
+        now - state->last_rx >= pdMS_TO_TICKS(expiry_ms)) {
         state->status.connected = false;
+        ++state->status.link_drops;
+        state->down_window_start = now;
         state->status.rssi_valid = false;
         state->rssi_sum_x2 = 0;
         state->rssi_samples = 0;
-        radio_link_queue_log(ESP_LOG_WARN, "%s LINK DOWN: no valid RX for %d ms, missed=%" PRIu32,
-                 radio_link_mode_name(request->mode), LINK_EXPIRY_MS, state->status.missed_packets);
+        radio_link_queue_log(ESP_LOG_WARN, "%s LINK DOWN: no valid RX for %u ms, missed=%" PRIu32,
+                 radio_link_mode_name(request->mode), expiry_ms, state->status.missed_packets);
         radio_link_publish_status(request, &state->status);
     }
 }
 
-static void check_slave_rx_timeout(const mode_request_t *request, link_state_t *state)
+static void record_bad_frame(const mode_request_t *request, link_state_t *state)
 {
-    const TickType_t window = pdMS_TO_TICKS(RX_WINDOW_MS);
-    const TickType_t elapsed = xTaskGetTickCount() - state->slave_window_start;
-    const uint32_t expired_windows = elapsed / window;
-    if (!expired_windows) {
-        return;
+    expire_link(request, state);
+    if (state->status.connected) {
+        ++state->status.missed_packets;
+        radio_link_publish_status(request, &state->status);
     }
-    state->slave_window_start += expired_windows * window;
-    state->slave_timed_misses += expired_windows;
-    state->status.missed_packets += expired_windows;
-    radio_link_queue_log(ESP_LOG_WARN, "SLAVE RX timeout: %d ms, provisional=%" PRIu32
-                  " total=%" PRIu32,
-             RX_WINDOW_MS, expired_windows, state->status.missed_packets);
-    radio_link_publish_status(request, &state->status);
 }
 
-static esp_err_t send_frame(const uint8_t frame[FRAME_LENGTH])
-{
-    const esp_err_t result = sx1262_send(frame, FRAME_LENGTH, TX_TIMEOUT_MS);
-    if (result == ESP_OK) {
-        record_activity(RADIO_LINK_ACTIVITY_TX);
-    }
-    return result;
-}
-
-static bool receive_frame(system_mode_t mode, uint8_t frame[FRAME_LENGTH],
+static bool receive_frame(const mode_request_t *request, link_state_t *state,
+                          uint8_t frame[FRAME_LENGTH],
                           sx1262_packet_metrics_t *metrics)
 {
+    const system_mode_t mode = request->mode;
     size_t length;
     const esp_err_t result =
         sx1262_receive_continuous(frame, FRAME_LENGTH, &length, metrics, RX_SLICE_MS);
     if (result != ESP_OK) {
+        if (result == ESP_ERR_INVALID_CRC || result == ESP_ERR_INVALID_SIZE ||
+            result == ESP_ERR_INVALID_RESPONSE) {
+            record_bad_frame(request, state);
+        }
         if (result != ESP_ERR_TIMEOUT) {
             radio_link_queue_log(ESP_LOG_WARN, "%s RX rejected: %s", radio_link_mode_name(mode), esp_err_to_name(result));
         }
         return false;
     }
-    if (length != FRAME_LENGTH) {
+    if (length != frame_length(mode)) {
+        record_bad_frame(request, state);
         radio_link_queue_log(ESP_LOG_WARN, "%s RX invalid length=%u", radio_link_mode_name(mode), (unsigned)length);
         return false;
     }
-    const unsigned expected_parity = mode == MODE_MASTER ? 1 : 0;
-    if ((frame[ALIVE_OFFSET] & 1U) != expected_parity) {
-        radio_link_queue_log(ESP_LOG_WARN, "%s RX wrong counter parity alive=%u", radio_link_mode_name(mode),
-                 (unsigned)frame[ALIVE_OFFSET]);
+    const unsigned expected_parity = is_master(mode) ? 1 : 0;
+    if ((frame[data_length(mode)] & 1U) != expected_parity) {
+        record_bad_frame(request, state);
+        radio_link_queue_log(ESP_LOG_WARN, "%s RX wrong sequence parity seq=%u", radio_link_mode_name(mode),
+                 (unsigned)frame[data_length(mode)]);
         return false;
     }
     return true;
 }
 
 static bool accept_frame(const mode_request_t *request, link_state_t *state,
-                         uint8_t counter, const sx1262_packet_metrics_t *metrics)
+                         uint8_t sequence, const sx1262_packet_metrics_t *metrics)
 {
-    uint32_t missed = 0;
-    if (!state->have_counter) {
-        state->status.missed_packets = 0;
-    } else {
-        const uint8_t delta = counter - state->last_counter;
-        if (request->mode == MODE_MASTER) {
-            missed = state->cycle - state->last_good_cycle - 1;
-        } else if (delta == 0 || delta >= 128) {
-            if (state->status.connected) {
-                radio_link_queue_log(ESP_LOG_WARN, "SLAVE RX duplicate or out of order alive=%u previous=%u",
-                         (unsigned)counter, (unsigned)state->last_counter);
-                return false;
-            }
-            radio_link_queue_log(ESP_LOG_INFO, "SLAVE counter resync alive=%u previous=%u",
-                     (unsigned)counter, (unsigned)state->last_counter);
-        } else {
-            missed = delta / 2 - 1;
-            /* A late consecutive packet supersedes a provisional timeout. */
-            state->status.missed_packets -= state->slave_timed_misses;
-            state->status.missed_packets += missed;
-            if (state->slave_timed_misses > missed) {
-                radio_link_queue_log(ESP_LOG_INFO, "SLAVE late RX alive=%u, cancelled %" PRIu32 " provisional miss(es)",
-                         (unsigned)counter, state->slave_timed_misses - missed);
-            }
+    expire_link(request, state);
+    if (request->mode == MODE_SLAVE && state->status.connected) {
+        const uint8_t delta = sequence - state->last_sequence;
+        if (delta == 0 || delta >= 128) {
+            radio_link_queue_log(ESP_LOG_WARN, "SLAVE RX duplicate or out of order seq=%u previous=%u",
+                     (unsigned)sequence, (unsigned)state->last_sequence);
+            record_bad_frame(request, state);
+            return false;
         }
-    }
-    if (missed) {
-        radio_link_queue_log(ESP_LOG_WARN, "%s counter gap prev=%u rx=%u missed=%" PRIu32 " total=%" PRIu32,
-                 radio_link_mode_name(request->mode), (unsigned)state->last_counter,
-                 (unsigned)counter, missed, state->status.missed_packets);
     }
     if (!state->status.connected) {
         radio_link_queue_log(ESP_LOG_INFO, "%s LINK UP", radio_link_mode_name(request->mode));
     }
-    state->have_counter = true;
-    state->last_counter = counter;
-    state->last_good_cycle = state->cycle;
+    state->last_sequence = sequence;
     state->last_rx = xTaskGetTickCount();
-    state->slave_window_start = state->last_rx;
-    state->slave_timed_misses = 0;
     state->status.connected = true;
     publish_rssi_average(request, state, state->last_rx);
     state->rssi_sum_x2 += metrics->rssi_dbm_x2;
     ++state->rssi_samples;
-    record_activity(RADIO_LINK_ACTIVITY_RX);
     radio_link_publish_status(request, &state->status);
     return true;
 }
 
-static bool master_cycle(const mode_request_t *request, link_state_t *state, TickType_t started)
+static void master_cycle(const mode_request_t *request, link_state_t *state, TickType_t started,
+                         int64_t fhss_deadline_us)
 {
+    const bool started_down = !state->status.connected;
     const int64_t started_us = esp_timer_get_time();
     uint8_t tx[FRAME_LENGTH];
-    const uint8_t counter = (uint8_t)(2U * state->cycle++);
-    esp_fill_random(tx, DATA_LENGTH);
-    tx[ALIVE_OFFSET] = counter;
-    const esp_err_t result = send_frame(tx);
+    const uint8_t sequence = state->next_sequence;
+    state->next_sequence += 2;
+    const system_mode_t mode = request->mode;
+    const size_t length = data_length(mode);
+    esp_fill_random(tx, length);
+    tx[length] = sequence;
+    if (is_fhss(mode)) {
+        write_u32(tx + FHSS_METADATA_OFFSET, state->fhss.session);
+        write_u32(tx + FHSS_METADATA_OFFSET + 4, state->fhss.slot);
+    }
+    const esp_err_t result = sx1262_send(tx, frame_length(mode), TX_TIMEOUT_MS);
     if (result != ESP_OK) {
-        radio_link_queue_log(ESP_LOG_WARN, "MASTER TX failed alive=%u: %s", (unsigned)counter, esp_err_to_name(result));
-        return false;
+        radio_link_queue_log(ESP_LOG_WARN, "%s TX failed seq=%u: %s", radio_link_mode_name(mode), (unsigned)sequence, esp_err_to_name(result));
+        return;
     }
     const esp_err_t rx_result = sx1262_start_continuous_rx();
     if (rx_result != ESP_OK) {
-        radio_link_queue_log(ESP_LOG_WARN, "MASTER TX done alive=%u, RX start failed: %s",
-                 (unsigned)counter, esp_err_to_name(rx_result));
-        return false;
+        radio_link_queue_log(ESP_LOG_WARN, "%s TX done seq=%u, RX start failed: %s",
+                 radio_link_mode_name(mode),
+                 (unsigned)sequence, esp_err_to_name(rx_result));
+        return;
     }
     const int64_t rx_ready_us = esp_timer_get_time() - started_us;
-    const int64_t deadline_us = started_us + RX_WINDOW_MS * 1000LL;
+    const int64_t deadline_us = is_fhss(mode) ? fhss_deadline_us :
+                                started_us + RX_WINDOW_MS * 1000LL;
 
-    const uint8_t expected = (uint8_t)(counter + 1);
+    const uint8_t expected = (uint8_t)(sequence + 1);
     uint8_t rx[FRAME_LENGTH];
     sx1262_packet_metrics_t metrics;
     mode_request_t pending;
     while (esp_timer_get_time() < deadline_us &&
            xQueuePeek(requests, &pending, 0) != pdPASS) {
-        if (!receive_frame(MODE_MASTER, rx, &metrics)) {
+        if (!receive_frame(request, state, rx, &metrics)) {
             continue;
         }
-        if (rx[ALIVE_OFFSET] != expected) {
-            radio_link_queue_log(ESP_LOG_WARN, "MASTER RX unexpected alive=%u expected=%u",
-                     (unsigned)rx[ALIVE_OFFSET], (unsigned)expected);
+        if (is_fhss(mode) &&
+            memcmp(tx + FHSS_METADATA_OFFSET, rx + FHSS_METADATA_OFFSET, 8) != 0) {
+            record_bad_frame(request, state);
+            continue;
+        }
+        if (rx[length] != expected) {
+            record_bad_frame(request, state);
+            radio_link_queue_log(ESP_LOG_WARN, "%s RX unexpected seq=%u expected=%u",
+                     radio_link_mode_name(mode),
+                     (unsigned)rx[length], (unsigned)expected);
             continue;
         }
         size_t i = 0;
-        while (i < DATA_LENGTH && (uint8_t)(tx[i] ^ rx[i]) == UINT8_MAX) {
+        while (i < length && (uint8_t)(tx[i] ^ rx[i]) == UINT8_MAX) {
             ++i;
         }
-        if (i != DATA_LENGTH) {
-            radio_link_queue_log(ESP_LOG_WARN, "MASTER RX inverse mismatch alive=%u byte=%u",
+        if (i != length) {
+            record_bad_frame(request, state);
+            radio_link_queue_log(ESP_LOG_WARN, "%s RX inverse mismatch seq=%u byte=%u",
+                     radio_link_mode_name(mode),
                      (unsigned)expected, (unsigned)i);
             continue;
         }
         const TickType_t elapsed = xTaskGetTickCount() - started;
         accept_frame(request, state, expected, &metrics);
-        radio_link_queue_log(ESP_LOG_INFO, "MASTER TX=%u RX=%u RSSI_x2=%d RX_ready_us=%" PRId64 " RTT_ms=%lu",
-                 (unsigned)counter, (unsigned)expected, (int)metrics.rssi_dbm_x2, rx_ready_us,
+        radio_link_queue_log(ESP_LOG_INFO, "%s TX=%u RX=%u RSSI_x2=%d RX_ready_us=%" PRId64 " RTT_ms=%lu",
+                 radio_link_mode_name(mode),
+                 (unsigned)sequence, (unsigned)expected, (int)metrics.rssi_dbm_x2, rx_ready_us,
                  (unsigned long)pdTICKS_TO_MS(elapsed));
-        log_frame(MODE_MASTER, "TX", tx);
-        log_frame(MODE_MASTER, "RX OK", rx);
-        return true;
+        log_frame(mode, "TX", tx);
+        log_frame(mode, "RX OK", rx);
+        return;
     }
-    radio_link_queue_log(ESP_LOG_WARN, "MASTER TX done alive=%u, no valid response alive=%u RX_ready_us=%" PRId64,
-             (unsigned)counter, (unsigned)expected, rx_ready_us);
-    log_frame(MODE_MASTER, "TX", tx);
-    return false;
+    if (started_down && xQueuePeek(requests, &pending, 0) != pdPASS) {
+        ++state->status.down_missed_packets;
+        radio_link_publish_status(request, &state->status);
+    }
+    radio_link_queue_log(ESP_LOG_WARN, "%s TX done seq=%u, no valid response seq=%u RX_ready_us=%" PRId64,
+             radio_link_mode_name(mode),
+             (unsigned)sequence, (unsigned)expected, rx_ready_us);
+    log_frame(mode, "TX", tx);
+}
+
+static bool fhss_accept_request(fhss_state_t *fhss, const uint8_t *frame,
+                                uint32_t tuned_slot, int64_t received_us)
+{
+    const uint32_t session = read_u32(frame + FHSS_METADATA_OFFSET);
+    const uint32_t slot = read_u32(frame + FHSS_METADATA_OFFSET + 4);
+    if (fhss->synchronized) {
+        if (slot != tuned_slot || slot == fhss->slot || session != fhss->session) {
+            return false;
+        }
+    } else if (slot % FHSS_SYNC_INTERVAL != 0) {
+        return false;
+    }
+    *fhss = (fhss_state_t){
+        .session = session, .slot = slot, .time_us = received_us, .synchronized = true,
+    };
+    return true;
 }
 
 static void slave_receive(const mode_request_t *request, link_state_t *state)
 {
+    const system_mode_t mode = request->mode;
+    const size_t length = data_length(mode);
+    uint32_t tuned_slot = 0;
+    if (is_fhss(mode)) {
+        const int64_t now_us = esp_timer_get_time();
+        fhss_state_t *fhss = &state->fhss;
+        if (now_us - fhss->time_us >= FHSS_HOLDOVER_US) {
+            fhss->synchronized = false;
+        }
+        if (fhss->synchronized) {
+            tuned_slot = fhss_slot_at(fhss, now_us);
+        }
+        if (fhss_retune(mode, state, tuned_slot) != ESP_OK) {
+            vTaskDelay(1);
+            return;
+        }
+    }
     uint8_t rx[FRAME_LENGTH];
     sx1262_packet_metrics_t metrics;
-    if (!receive_frame(MODE_SLAVE, rx, &metrics) ||
-        !accept_frame(request, state, rx[ALIVE_OFFSET], &metrics)) {
-        check_slave_rx_timeout(request, state);
+    bool accepted = receive_frame(request, state, rx, &metrics);
+    const int64_t received_us = esp_timer_get_time();
+    if (accepted && is_fhss(mode) &&
+        !fhss_accept_request(&state->fhss, rx, tuned_slot, received_us)) {
+        record_bad_frame(request, state);
+        accepted = false;
+    }
+    if (!accepted || !accept_frame(request, state, rx[length], &metrics)) {
+        if (!state->status.connected) {
+            const TickType_t window = pdMS_TO_TICKS(cycle_ms(mode));
+            const TickType_t elapsed = xTaskGetTickCount() - state->down_window_start;
+            const uint32_t missed = elapsed / window;
+            if (missed) {
+                state->down_window_start += missed * window;
+                state->status.down_missed_packets += missed;
+                radio_link_publish_status(request, &state->status);
+            }
+        }
         return;
     }
-    const int64_t received_us = esp_timer_get_time();
     uint8_t tx[FRAME_LENGTH];
-    for (size_t i = 0; i < DATA_LENGTH; ++i) {
+    if (is_fhss(mode)) {
+        memcpy(tx + FHSS_METADATA_OFFSET, rx + FHSS_METADATA_OFFSET, 8);
+    }
+    for (size_t i = 0; i < length; ++i) {
         tx[i] = (uint8_t)~rx[i];
     }
-    tx[ALIVE_OFFSET] = (uint8_t)(rx[ALIVE_OFFSET] + 1);
-    /* Leave time for the MASTER to switch from TX to continuous RX. */
-    wait_for_reply_slot(received_us);
-    const esp_err_t result = send_frame(tx);
+    tx[length] = (uint8_t)(rx[length] + 1);
+    const esp_err_t result = sx1262_send(tx, frame_length(mode), TX_TIMEOUT_MS);
     const int64_t reply_us = esp_timer_get_time() - received_us;
     ESP_ERROR_CHECK_WITHOUT_ABORT(sx1262_start_continuous_rx());
-    log_frame(MODE_SLAVE, "RX OK", rx);
+    log_frame(mode, "RX OK", rx);
     if (result == ESP_OK) {
-        radio_link_queue_log(ESP_LOG_INFO, "SLAVE RX=%u TX_done=%u RSSI_x2=%d reply_us=%" PRId64,
-                 (unsigned)rx[ALIVE_OFFSET], (unsigned)tx[ALIVE_OFFSET],
+        radio_link_queue_log(ESP_LOG_INFO, "%s RX=%u TX_done=%u RSSI_x2=%d reply_us=%" PRId64,
+                 radio_link_mode_name(mode),
+                 (unsigned)rx[length], (unsigned)tx[length],
                  (int)metrics.rssi_dbm_x2, reply_us);
-        log_frame(MODE_SLAVE, "TX", tx);
+        log_frame(mode, "TX", tx);
     } else {
-        radio_link_queue_log(ESP_LOG_WARN, "SLAVE RX=%u RSSI_x2=%d TX failed alive=%u: %s",
-                 (unsigned)rx[ALIVE_OFFSET], (int)metrics.rssi_dbm_x2,
-                 (unsigned)tx[ALIVE_OFFSET], esp_err_to_name(result));
+        radio_link_queue_log(ESP_LOG_WARN, "%s RX=%u RSSI_x2=%d TX failed seq=%u: %s",
+                 radio_link_mode_name(mode),
+                 (unsigned)rx[length], (int)metrics.rssi_dbm_x2,
+                 (unsigned)tx[length], esp_err_to_name(result));
     }
+}
+
+static void fhss_master_cycle(const mode_request_t *request, link_state_t *state)
+{
+    fhss_state_t *fhss = &state->fhss;
+    const int64_t now_us = esp_timer_get_time();
+    const int64_t elapsed_us = now_us - fhss->time_us;
+    const uint32_t slot = elapsed_us / FHSS_SLOT_US;
+    const int64_t phase_us = elapsed_us % FHSS_SLOT_US;
+
+    // Skip overdue transmissions and never retry on a later hop.
+    if ((!fhss->synchronized || fhss->slot != slot) && phase_us <= FHSS_MAX_TX_LATENESS_US) {
+        fhss->slot = slot;
+        fhss->synchronized = true;
+        const esp_err_t result = fhss_retune(request->mode, state, slot);
+        if (result == ESP_OK) {
+            const int64_t deadline_us = now_us - phase_us + FHSS_SLOT_US - FHSS_RX_GUARD_US;
+            master_cycle(request, state, xTaskGetTickCount(), deadline_us);
+        } else {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(result);
+        }
+        return;
+    }
+    mode_request_t pending;
+    const unsigned wait_ms = (FHSS_SLOT_US - phase_us + 999) / 1000;
+    xQueuePeek(requests, &pending, pdMS_TO_TICKS(wait_ms));
 }
 
 static void radio_task(void *argument)
@@ -395,7 +536,8 @@ static void radio_task(void *argument)
     config.tx_power_dbm = CONFIG_LINK_TX_POWER_DBM;
     const esp_err_t result = sx1262_init(&config);
     mode_request_t request = {.mode = MODE_MASTER};
-    link_state_t state = {.rssi_window_start = xTaskGetTickCount()};
+    const TickType_t started = xTaskGetTickCount();
+    link_state_t state = {.rssi_window_start = started, .down_window_start = started};
     if (result != ESP_OK) {
         ESP_ERROR_CHECK_WITHOUT_ABORT(result);
         state.status.scan_state = SCAN_ERROR;
@@ -411,7 +553,15 @@ static void radio_task(void *argument)
     for (;;) {
         if (xQueueReceive(requests, &request, 0) == pdPASS) {
             const TickType_t now = xTaskGetTickCount();
-            state = (link_state_t){.slave_window_start = now, .rssi_window_start = now};
+            state = (link_state_t){
+                .status = {
+                    .missed_packets = state.status.missed_packets,
+                    .link_drops = state.status.link_drops,
+                    .down_missed_packets = state.status.down_missed_packets,
+                },
+                .rssi_window_start = now,
+                .down_window_start = now,
+            };
             ESP_ERROR_CHECK_WITHOUT_ABORT(sx1262_standby());
             radio_link_queue_log(ESP_LOG_INFO, "%s mode selected", radio_link_mode_name(request.mode));
             radio_link_publish_status(&request, &state.status);
@@ -421,24 +571,31 @@ static void radio_task(void *argument)
                 xQueuePeek(requests, &pending, portMAX_DELAY);
                 continue;
             }
-            const esp_err_t link_config = sx1262_set_config(&config);
+            sx1262_config_t selected_config = config;
+            if (is_fhss(request.mode)) {
+                selected_config.frequency_hz = FHSS_SYNC_HZ;
+                selected_config.gfsk.sync_word[3] = 0x4A;
+            }
+            const esp_err_t link_config = sx1262_set_config(&selected_config);
             if (link_config != ESP_OK) {
                 ESP_ERROR_CHECK_WITHOUT_ABORT(link_config);
                 mode_request_t pending;
                 xQueuePeek(requests, &pending, portMAX_DELAY);
                 continue;
             }
+            if (request.mode == MODE_M_FHSS) {
+                state.fhss.session = esp_random();
+                state.fhss.time_us = esp_timer_get_time();
+            }
         }
         expire_link(&request, &state);
         publish_rssi_average(&request, &state, xTaskGetTickCount());
-        if (request.mode == MODE_MASTER) {
+        if (request.mode == MODE_M_FHSS) {
+            fhss_master_cycle(&request, &state);
+        } else if (request.mode == MODE_MASTER) {
             const TickType_t started = xTaskGetTickCount();
             mode_request_t pending;
-            if (!master_cycle(&request, &state, started) &&
-                xQueuePeek(requests, &pending, 0) != pdPASS) {
-                ++state.status.missed_packets;
-                radio_link_publish_status(&request, &state.status);
-            }
+            master_cycle(&request, &state, started, 0);
             expire_link(&request, &state);
             const TickType_t elapsed = xTaskGetTickCount() - started;
             if (elapsed < pdMS_TO_TICKS(CYCLE_MS)) {
@@ -455,33 +612,14 @@ esp_err_t radio_link_start(void)
     requests = xQueueCreate(1, sizeof(mode_request_t));
     samples = xQueueCreate(1, sizeof(link_sample_t));
     uart_logs = xQueueCreate(UART_LOG_QUEUE_DEPTH, sizeof(uart_log_t));
-    reply_ready = xSemaphoreCreateBinary();
-    esp_err_t result = ESP_ERR_NO_MEM;
     TaskHandle_t logger = NULL;
-    if (requests && samples && uart_logs && reply_ready) {
-        const esp_timer_create_args_t timer = {
-            .callback = reply_timer_elapsed,
-            .name = "slave_reply",
-        };
-        result = esp_timer_create(&timer, &reply_timer);
-        if (result == ESP_OK) {
-            if (xTaskCreate(uart_log_task, "radio_uart", 4096, NULL, 2, &logger) == pdPASS &&
-                xTaskCreate(radio_task, "radio_link", 4096, NULL, 5, NULL) == pdPASS) {
-                return ESP_OK;
-            }
-            result = ESP_ERR_NO_MEM;
-        }
+    if (requests && samples && uart_logs &&
+        xTaskCreate(uart_log_task, "radio_uart", 4096, NULL, 2, &logger) == pdPASS &&
+        xTaskCreate(radio_task, "radio_link", 4096, NULL, 5, NULL) == pdPASS) {
+        return ESP_OK;
     }
     if (logger) {
         vTaskDelete(logger);
-    }
-    if (reply_timer) {
-        esp_timer_delete(reply_timer);
-        reply_timer = NULL;
-    }
-    if (reply_ready) {
-        vSemaphoreDelete(reply_ready);
-        reply_ready = NULL;
     }
     if (uart_logs) {
         vQueueDelete(uart_logs);
@@ -495,15 +633,15 @@ esp_err_t radio_link_start(void)
         vQueueDelete(samples);
         samples = NULL;
     }
-    return result;
+    return ESP_ERR_NO_MEM;
 }
 
 void radio_link_set_mode(system_mode_t mode)
 {
     if (requests) {
-        portENTER_CRITICAL(&activity_lock);
+        portENTER_CRITICAL(&generation_lock);
         const uint32_t next_generation = ++generation;
-        portEXIT_CRITICAL(&activity_lock);
+        portEXIT_CRITICAL(&generation_lock);
         const mode_request_t request = {.mode = mode, .generation = next_generation};
         xQueueOverwrite(requests, &request);
     }
@@ -513,21 +651,12 @@ radio_link_status_t radio_link_get_status(void)
 {
     link_sample_t sample;
     if (samples && xQueuePeek(samples, &sample, 0) == pdPASS) {
-        portENTER_CRITICAL(&activity_lock);
+        portENTER_CRITICAL(&generation_lock);
         const bool current = sample.generation == generation;
-        portEXIT_CRITICAL(&activity_lock);
+        portEXIT_CRITICAL(&generation_lock);
         if (current) {
             return sample.status;
         }
     }
     return (radio_link_status_t){0};
-}
-
-unsigned radio_link_take_activity(void)
-{
-    portENTER_CRITICAL(&activity_lock);
-    const unsigned events = activity;
-    activity = 0;
-    portEXIT_CRITICAL(&activity_lock);
-    return events;
 }

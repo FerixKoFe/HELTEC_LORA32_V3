@@ -14,7 +14,7 @@ receive bandwidth, a 32-bit preamble, a 16-bit detector and 32-bit sync word
 `2D D4 B7 E1`. The packet engine accepts variable payloads up to 64 bytes,
 adds and validates CRC-16/CCITT (polynomial `0x1021`, seed `0xFFFF`), and
 uses whitening seed `0x1FF`. The MASTER/SLAVE application sends and expects
-51 bytes: 50 data bytes and one Alive CNT byte.
+51 bytes: 50 data bytes and one sequence byte.
 
 MASTER sends a fresh random payload with an even counter on a nominal
 20 ms cycle. Both roles allow 110% of the cycle (22 ms) for a valid

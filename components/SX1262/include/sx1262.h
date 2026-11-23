@@ -66,6 +66,8 @@ esp_err_t sx1262_deinit(void);
 esp_err_t sx1262_set_config(const sx1262_config_t *config);
 esp_err_t sx1262_get_config(sx1262_config_t *config);
 esp_err_t sx1262_set_frequency(uint32_t frequency_hz);
+/* Change frequency within the current image-calibration range. */
+esp_err_t sx1262_retune(uint32_t frequency_hz);
 esp_err_t sx1262_get_frequency(uint32_t *frequency_hz);
 esp_err_t sx1262_set_tx_power(int8_t dbm);
 esp_err_t sx1262_get_tx_power(int8_t *dbm);
