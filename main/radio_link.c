@@ -501,7 +501,10 @@ esp_err_t radio_link_start(void)
 void radio_link_set_mode(system_mode_t mode)
 {
     if (requests) {
-        const mode_request_t request = {.mode = mode, .generation = ++generation};
+        portENTER_CRITICAL(&activity_lock);
+        const uint32_t next_generation = ++generation;
+        portEXIT_CRITICAL(&activity_lock);
+        const mode_request_t request = {.mode = mode, .generation = next_generation};
         xQueueOverwrite(requests, &request);
     }
 }
@@ -509,8 +512,13 @@ void radio_link_set_mode(system_mode_t mode)
 radio_link_status_t radio_link_get_status(void)
 {
     link_sample_t sample;
-    if (samples && xQueuePeek(samples, &sample, 0) == pdPASS && sample.generation == generation) {
-        return sample.status;
+    if (samples && xQueuePeek(samples, &sample, 0) == pdPASS) {
+        portENTER_CRITICAL(&activity_lock);
+        const bool current = sample.generation == generation;
+        portEXIT_CRITICAL(&activity_lock);
+        if (current) {
+            return sample.status;
+        }
     }
     return (radio_link_status_t){0};
 }

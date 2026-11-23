@@ -2,6 +2,7 @@
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "radio_link.h"
 #include "ssd1306.h"
@@ -15,10 +16,14 @@ static const TickType_t activity_flash_ticks = pdMS_TO_TICKS(40);
 static const TickType_t display_refresh_ticks = pdMS_TO_TICKS(30);
 
 static const TickType_t battery_poll_ticks = pdMS_TO_TICKS(2000);
+static const TickType_t display_poll_ticks = pdMS_TO_TICKS(10);
 
-void app_main(void)
+static QueueHandle_t display_modes;
+static TaskHandle_t led_task_handle;
+
+static void led_task(void *argument)
 {
-    user_button_init();
+    (void)argument;
 
     const gpio_config_t led_config = {
         .pin_bit_mask = 1ULL << USER_LED_GPIO,
@@ -27,13 +32,37 @@ void app_main(void)
     ESP_ERROR_CHECK(gpio_config(&led_config));
     ESP_ERROR_CHECK(gpio_set_level(USER_LED_GPIO, 0));
 
+    for (;;) {
+        uint32_t mode;
+        if (xTaskNotifyWait(0, 0, &mode, portMAX_DELAY) == pdTRUE) {
+            ESP_ERROR_CHECK(gpio_set_level(USER_LED_GPIO, mode == MODE_SLAVE));
+        }
+    }
+}
+
+static void button_task(void *argument)
+{
+    (void)argument;
+    user_button_init();
     user_button_sync();
     system_mode_t mode = MODE_MASTER;
+    for (;;) {
+        if (user_button_poll_pressed()) {
+            mode = mode == MODE_SCAN_LORA ? MODE_MASTER : (system_mode_t)(mode + 1);
+            radio_link_set_mode(mode);
+            xQueueOverwrite(display_modes, &mode);
+            xTaskNotify(led_task_handle, (uint32_t)mode, eSetValueWithOverwrite);
+        }
+    }
+}
+
+static void display_task(void *argument)
+{
+    (void)argument;
     const esp_err_t startup_display = ssd1306_show_centered_text("MASTER", 1);
     ESP_ERROR_CHECK_WITHOUT_ABORT(startup_display);
     bool display_ready = startup_display == ESP_OK;
     const TickType_t startup_screen_since = xTaskGetTickCount();
-    ESP_ERROR_CHECK_WITHOUT_ABORT(radio_link_start());
 
     bool battery_ready = false;
     if (!battery_is_usb_only()) {
@@ -57,13 +86,12 @@ void app_main(void)
     TickType_t last_display_attempt = xTaskGetTickCount() - display_refresh_ticks;
 
     while (true) {
-        const bool mode_button_pressed = user_button_poll_pressed();
-        const TickType_t now = xTaskGetTickCount();
-        if (mode_button_pressed) {
-            mode = mode == MODE_SCAN_LORA ? MODE_MASTER : (system_mode_t)(mode + 1);
-            ESP_ERROR_CHECK(gpio_set_level(USER_LED_GPIO, mode == MODE_SLAVE));
-            radio_link_set_mode(mode);
+        vTaskDelay(display_poll_ticks);
+        system_mode_t mode;
+        if (xQueuePeek(display_modes, &mode, 0) != pdPASS) {
+            continue;
         }
+        const TickType_t now = xTaskGetTickCount();
         const unsigned activity = radio_link_take_activity();
         if (activity & RADIO_LINK_ACTIVITY_TX) {
             last_tx = now;
@@ -122,4 +150,20 @@ void app_main(void)
             }
         }
     }
+}
+
+void app_main(void)
+{
+    display_modes = xQueueCreate(1, sizeof(system_mode_t));
+    ESP_ERROR_CHECK(display_modes ? ESP_OK : ESP_ERR_NO_MEM);
+    const system_mode_t initial_mode = MODE_MASTER;
+    xQueueOverwrite(display_modes, &initial_mode);
+
+    ESP_ERROR_CHECK_WITHOUT_ABORT(radio_link_start());
+    ESP_ERROR_CHECK(xTaskCreate(led_task, "status_led", 2048, NULL, 4, &led_task_handle) == pdPASS ?
+                    ESP_OK : ESP_ERR_NO_MEM);
+    ESP_ERROR_CHECK(xTaskCreate(button_task, "user_button", 3072, NULL, 4, NULL) == pdPASS ?
+                    ESP_OK : ESP_ERR_NO_MEM);
+    ESP_ERROR_CHECK(xTaskCreate(display_task, "oled", 4096, NULL, 3, NULL) == pdPASS ?
+                    ESP_OK : ESP_ERR_NO_MEM);
 }
